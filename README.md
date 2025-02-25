@@ -1,53 +1,25 @@
-# [Simple and Effective Masked Diffusion Language Models](http://arxiv.org/abs/2406.07524) (NeurIPS 2024)
-By [Subham Sekhar Sahoo](https://s-sahoo.github.io), [Marianne Arriola](https://mariannearriola.github.io), [Yair Schiff](https://yair-schiff.github.io), [Aaron Gokaslan](https://skylion007.github.io), [Edgar Marroquin](https://emarro.github.io),
-[Justin T Chiu](https://justinchiu.netlify.app), [Alexander Rush](https://rush-nlp.com), [Volodymyr Kuleshov](https://www.cs.cornell.edu/~kuleshov/)
+# Remasking Discrete Diffusion Models with Inference-Time Scaling
 
 [![arXiv](https://img.shields.io/badge/arXiv-2406.07524-red.svg)](https://arxiv.org/abs/2406.07524)
+[![deploy](https://img.shields.io/badge/Blog%20%20-8A2BE2)](https://remdm.github.io)
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/18nC6q7dWq154fI1BXPLwmtnS7Zvbrv6p?usp=sharing/)
-[![YouTube](https://img.shields.io/badge/YouTube-%23FF0000.svg?logo=YouTube&logoColor=white)](https://youtu.be/WjAUX23vgfg?si=lI-qiDFqh25qtnQ8)
-[![deploy](https://img.shields.io/badge/Blog%20%20-8A2BE2)](https://s-sahoo.com/mdlm/)
-[![deploy](https://img.shields.io/badge/Huggingface%20-MDLM%20-blue)](https://huggingface.co/collections/kuleshov-group/mdlm-6671bee1cc71f0dce4f2d00a)
 
-![graphical_abstract_updated_2](https://github.com/s-sahoo/mdlm/assets/16799748/b0cab23a-d966-45fa-a3ad-be972b23a98a)
+![graphical_abstract](./assets/graphical_abstract.png)
 
-We introduce *MDLM*, a **M**asked discrete **D**iffusion **L**anguage **M**odel that features
-a novel (SUBS)titution based
-parameterization which simplifies the absorbing state diffusion
-loss to a mixture of
-classical masked language modeling losses. In doing so, we achieve
-SOTA perplexity numbers on LM1B and OpenWebText among diffusion models while achiving competitive zero-shot perplexity with SOTA AR models on numerous datasets. We provide a demo in this [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/18nC6q7dWq154fI1BXPLwmtnS7Zvbrv6p?usp=sharing/) notebook and a video tutorial here:
-<p align="center">
-  <a href="https://youtu.be/WjAUX23vgfg?si=bM1E-Bt-nwOmsVif" title="Click">
-    <img src="https://github.com/s-sahoo/mdlm/blob/gh-pages/static/images/youtube_thumbnail.png" alt="Everything Is AWESOME" style="width:50%;">
-  </a>
-</p>
+We introduce *ReMDM*, a simple and general framework to design remasking samplers for masked discrete diffusion models. In this repo, we provide our implementation of different ReMDM strategies for unconditional text generation on OpenWebText. We also provide a demo in this [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/18nC6q7dWq154fI1BXPLwmtnS7Zvbrv6p?usp=sharing/) notebook showing how to download the MDLM checkpoint and implement ReMDM-loop on top of it.
 
 
-In this repo, we release:
-* **The MDLM framework.**
-  1. SUBStitution based parameterization
-  2. Simplified loss calculation for masked diffusion processes
-* **Baseline implementations** [[Examples]](#baselines):
-  1. Autoregressive model that matches the SOTA AR performance on LM1B.
-  2. Score Entropy Based Discrete Diffusion [SEDD](https://arxiv.org/abs/2310.16834).
-  3. An efficient implementation of the absorbing state [D3PM](https://arxiv.org/abs/2107.03006) that beats the previous SOTA text diffusion model SEDD on LM1B.
-* **Samplers**
-  1. Ancestral sampling as proposed in D3PM.
-  2. Analytic sampler as proposed in SEDD.
-  3. Our proposed efficient sampler that
-     - makes MDLM **~3-4x** faster than the existing diffusion models. [[Example]](#sample-gen)
-     - supports semi-autoregressive (SAR) generation.  [[Example]](#semi-ar-gen)
-
-<a name="code-organization"></a>
-## Code Organization
-1. ```main.py```: Routines for training and evaluation
-2. ```noise_schedule.py```: Noise schedules
-3. ```diffusion.py```: Forward/reverse diffusion
-4. ```dataloader.py```: Dataloaders
-5. ```utils.py```: LR scheduler, logging, `fsspec` handling
-6. ```models/```: Denoising network architectures. Supports [DiT](https://arxiv.org/abs/2212.09748), AR transformer, and [Mamba](https://arxiv.org/abs/2312.00752)
-7. ```configs/```: Config files for datasets/denoising networks/noise schedules/LR schedules
-8. ```scripts/```: Shell scripts for training/evaluation
+Our main add-ons from MDLM are:
+* **Evaluation Metrics**
+  1. Add MAUVE computation code.
+  2. Add entropy computation code.
+* **Sampling Tricks** 
+  1. Replace fp32 gumbel noise with the correct fp64 gumbel noise.
+  2. Implement nucleus sampling.
+* **ReMDM Strategies**
+  1. Implement different ReMDM strategies, including ReMDM-cap, ReMDM-rescale, ReMDM-conf, and ReMDM-loop.
+* **Predictor-Corrector Samplers**
+  1. Implement forward-backward and discrete flow matching corrector samplers as extra baselines.
 
 
 <a name="getting_started"></a>
@@ -221,16 +193,9 @@ python main.py \
 ```
 
 ### Acknowledgements
-This repository was built off of [SEDD](https://github.com/louaaron/Score-Entropy-Discrete-Diffusion).
+This repository was built off of [MDLM] (https://github.com/kuleshov-group/mdlm) which was based on [SEDD](https://github.com/louaaron/Score-Entropy-Discrete-Diffusion).
 
 ## Citation
 ```
-@inproceedings{
-sahoo2024simple,
-title={Simple and Effective Masked Diffusion Language Models},
-author={Subham Sekhar Sahoo and Marianne Arriola and Aaron Gokaslan and Edgar Mariano Marroquin and Alexander M Rush and Yair Schiff and Justin T Chiu and Volodymyr Kuleshov},
-booktitle={The Thirty-eighth Annual Conference on Neural Information Processing Systems},
-year={2024},
-url={https://openreview.net/forum?id=L4uaAR4ArM}
-}
+
 ```
