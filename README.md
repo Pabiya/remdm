@@ -24,13 +24,13 @@ Our main add-ons from MDLM are:
 
 <a name="getting_started"></a>
 
-## Getting started in this repository
+## Getting started
 
 To get started, create a conda environment containing the required dependencies.
 
 ```bash
 conda env create -f requirements.yaml
-conda activate mdlm
+conda activate remdm
 ```
 
 Create the following directories to store saved models and slurm logs:
@@ -38,16 +38,9 @@ Create the following directories to store saved models and slurm logs:
 mkdir outputs
 mkdir watch_folder
 ```
-and run the training as a batch job:
-```bash
-sbatch scripts/train_owt_mdlm.sh
-```
 
-### Checkpoints
-
-We have uploaded MDLM model trained on OpenWebText for 1M training steps to the Huggingface hub 🤗:
-[kuleshov-group/mdlm-owt](https://huggingface.co/kuleshov-group/mdlm-owt)
-Furthermore, we have released the checkpoints for the AR and SEDD baselines trained on OpenWebText in this [Google Drive folder](https://drive.google.com/drive/folders/16LuuptK7Xfk-vzhQYZBZ0SA-B-BFluau?usp=sharing).
+Download checkpoints from this [Google Drive folder](https://drive.google.com/drive/folders/16LuuptK7Xfk-vzhQYZBZ0SA-B-BFluau?usp=sharing) released by the MDLM repo and put them under
+the following directory `./outputs/checkpoints`
 
 ## Reproducing Experiments
 
