@@ -44,9 +44,12 @@ the following directory `./outputs/checkpoints`
 
 ## Reproducing Experiments
 
-Below, we describe the steps required for reproducing the experiments in the paper.
-Throughout, the main entry point for running experiments is the [`main.py`](./main.py) script.
-We also provide sample `slurm` scripts for launching pre-training and downstream fine-tuning experiments in the [`scrips/`](./scripts) directory.
+Below, we demonstrate how to generate text samples using different models and samplers. It should be as easy as running the following SLURM bash scripts.
+
+* MDLM
+```bash
+sbatch scripts/mdlm.sh
+```
 
 
 ### Generate Samples

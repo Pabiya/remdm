@@ -25,6 +25,13 @@ LOG2 = math.log(2)
 
 def _sample_categorical(categorical_probs):
   categorical_probs = categorical_probs.to(torch.float64)
+  # sorted_probs, sorted_indices = torch.sort(categorical_probs, descending=True, dim=-1)
+  # cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+  # top_p_mask = cumulative_probs <= p
+  # top_p_mask[..., 0] = True
+  # nucleus_probs = sorted_probs * top_p_mask
+  # nucleus_probs /= nucleus_probs.sum(dim=-1, keepdim=True)
+  # categorical_probs = torch.zeros_like(categorical_probs).scatter_(-1, sorted_indices, nucleus_probs)
   gumbel_norm = (
     1e-10
     - (torch.rand_like(categorical_probs) + 1e-10).log())
@@ -264,11 +271,12 @@ class Diffusion(L.LightningModule):
   def _subs_parameterization(self, logits, xt):
     # log prob at the mask index = - infinity
     logits[:, :, self.mask_index] += self.neg_infinity
-    
+
     # Normalize the logits such that x.exp() is
     # a probability distribution over vocab_size.
-    logits = logits - torch.logsumexp(logits, dim=-1,
-                                      keepdim=True)
+    # logits = logits - torch.logsumexp(logits, dim=-1,
+    #                                   keepdim=True)
+    logits = logits.log_softmax(dim = -1)
 
     # Apply updates directly in the logits matrix.
     # For the logits of the unmasked tokens, set all values
@@ -575,6 +583,43 @@ class Diffusion(L.LightningModule):
         self.gen_ppl_metric.update(
           nlls, first_eos[..., 1:] + token_mask[..., 1:])
 
+  @torch.no_grad()    
+  def compute_mdlm_perplexity(self, text_samples):
+    os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+    max_length = self.config.model.length
+    tokenizer_kwargs = {
+        'return_tensors': 'pt',
+        'return_token_type_ids': False,
+        'return_attention_mask': True,
+        'truncation': True,
+        'padding': True,
+        'max_length': max_length,
+      }
+    samples = self.tokenizer(text_samples, ** tokenizer_kwargs)
+    attn_mask = samples['attention_mask'].to(self.device)
+    input_ids = samples['input_ids'].to(self.device)
+    bsz = self.config.loader.batch_size
+    
+    if self.ema:
+      self.ema.store(itertools.chain(
+        self.backbone.parameters(),
+        self.noise.parameters()))
+      self.ema.copy_to(itertools.chain(
+        self.backbone.parameters(),
+        self.noise.parameters()))
+    self.backbone.eval()
+    self.noise.eval()
+    assert self.valid_metrics.nll.mean_value == 0
+    assert self.valid_metrics.nll.weight == 0
+    for i in range(int(attn_mask.shape[0] / bsz)):
+      upper_bound = min((i + 1) * bsz, attn_mask.shape[0])
+      batch = {'attention_mask': attn_mask[i * bsz : upper_bound, :], 'input_ids': input_ids[i * bsz : upper_bound, :]}
+      self._compute_loss(batch, 'val')
+    if self.ema:
+      self.ema.restore(
+        itertools.chain(self.backbone.parameters(),
+                        self.noise.parameters()))
+
   def q_xt(self, x, move_chance):
     """Computes the noisy sample xt.
 
@@ -592,7 +637,99 @@ class Diffusion(L.LightningModule):
     return self.mask_index * torch.ones(
       * batch_dims, dtype=torch.int64)
 
-  def _ddpm_caching_update(self, x, t, dt, p_x0=None):
+  def _dfm_caching_update(self, x, t, p_x0=None, nfe=0):
+    assert self.config.noise.type == 'loglinear'
+    sigma_t, _ = self.noise(t)
+    if t.ndim > 1:
+      t = t.squeeze(-1)
+    assert t.ndim == 1
+    timestep = t[0].item()
+    at = self.config.sampling.quadratic * timestep ** 0.25 * (1 - timestep) ** 0.25 + 1
+    bt = at - 1
+    if timestep == 1:
+      dt = 1 / self.config.sampling.steps
+    else:
+      dt = min(1 / self.config.sampling.steps, 1 / (at / timestep  + bt / (1 - timestep)))
+    move_chance_t = t[:, None, None]
+    move_chance_s = (t - dt)[:, None, None]
+    assert move_chance_t.ndim == 3
+    if p_x0 is None:
+      log_p_x0 = self.forward(x, sigma_t)
+      nfe += 1
+      if self.config.sampling.nucleus_p == 1:
+        p_x0 = (log_p_x0 / self.config.sampling.temperature).softmax(dim=-1)
+      else:
+        p_x0 = log_p_x0.exp()
+        sorted_probs, sorted_indices = torch.sort(p_x0, descending=True, dim=-1)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        top_p_mask = cumulative_probs <= self.config.sampling.nucleus_p
+        top_p_mask[..., 0] = True
+        nucleus_probs = sorted_probs * top_p_mask
+        nucleus_probs /= nucleus_probs.sum(dim=-1, keepdim=True)
+        p_x0 = torch.zeros_like(p_x0).scatter_(-1, sorted_indices, nucleus_probs)
+    
+    assert move_chance_t.ndim == p_x0.ndim
+
+    if timestep == 1:
+      q_xs = p_x0 * (move_chance_t - move_chance_s)
+      q_xs[:, :, self.mask_index] = move_chance_s[:, :, 0]
+      _x = _sample_categorical(q_xs)
+    
+      copy_flag = (x != self.mask_index).to(x.dtype)
+      xs = copy_flag * x + (1 - copy_flag) * _x
+      if torch.allclose(xs, x) and not self.time_conditioning:
+        p_x0_cache = p_x0
+      else:
+        p_x0_cache = None
+      return p_x0_cache, xs, timestep - dt, nfe
+
+    alpha_t = 1 - move_chance_t[0].item()
+    alpha_s = 1 - move_chance_s[0].item()
+    coef1 = at * (alpha_s - alpha_t) / (1 - alpha_t)
+    q_xs = p_x0 * coef1
+    q_xs[..., self.mask_index] = 1 - coef1
+    coef2 = 1 - bt * (alpha_s / alpha_t - 1)
+    q_xs2 = p_x0 * coef2
+    q_xs2[..., self.mask_index] = 1 - coef2
+    masked_flag = (x == self.mask_index).to(torch.bool)
+    q_xs = torch.where(masked_flag.unsqueeze(-1), q_xs, q_xs2)
+    xs = _sample_categorical(q_xs)
+  
+    if torch.allclose(xs, x) and not self.time_conditioning:
+      p_x0_cache = p_x0
+    else:
+      p_x0_cache = None
+
+    return p_x0_cache, xs, timestep - dt, nfe
+  
+  def _mask_predict_update(self, x, t, dt, conf=None):
+    # mask
+    mask_number = int(t[0].item() * self.config.model.length)
+    _, indices = torch.topk(conf, mask_number, dim=1, largest=False)
+    for i in range(x.size(0)):
+      x[i, indices[i]] = 50257
+    # predict
+    assert self.config.noise.type == 'loglinear'
+    sigma_t, _ = self.noise(t)
+    if t.ndim > 1:
+      t = t.squeeze(-1)
+    assert t.ndim == 1
+    p_x0 = self.forward(x, sigma_t).exp()
+    conf_backup = p_x0.clone()
+    if self.config.sampling.nucleus_p < 1:
+        sorted_probs, sorted_indices = torch.sort(p_x0, descending=True, dim=-1)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        top_p_mask = cumulative_probs <= self.config.sampling.nucleus_p
+        top_p_mask[..., 0] = True
+        nucleus_probs = sorted_probs * top_p_mask
+        nucleus_probs /= nucleus_probs.sum(dim=-1, keepdim=True)
+        p_x0 = torch.zeros_like(p_x0).scatter_(-1, sorted_indices, nucleus_probs)
+    xs = _sample_categorical(p_x0)
+    for i in range(x.size(0)):
+       conf[i, indices[i]] = conf_backup[i, indices[i], xs[i, indices[i]]]
+    return xs, conf
+  
+  def _p_condition_update(self, x, t, dt, p_x0=None, nfe=0, conf=None):
     assert self.config.noise.type == 'loglinear'
     sigma_t, _ = self.noise(t)
     if t.ndim > 1:
@@ -600,7 +737,127 @@ class Diffusion(L.LightningModule):
     assert t.ndim == 1
     move_chance_t = t[:, None, None]
     move_chance_s = (t - dt)[:, None, None]
-    assert move_chance_t.ndim == 3, move_chance_t.shape
+    assert move_chance_t.ndim == 3
+    if p_x0 is None:
+      p_x0 = self.forward(x, sigma_t).exp()
+      nfe += 1
+      if self.config.sampling.nucleus_p < 1:
+        sorted_probs, sorted_indices = torch.sort(p_x0, descending=True, dim=-1)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        top_p_mask = cumulative_probs <= self.config.sampling.nucleus_p
+        top_p_mask[..., 0] = True
+        nucleus_probs = sorted_probs * top_p_mask
+        nucleus_probs /= nucleus_probs.sum(dim=-1, keepdim=True)
+        p_x0 = torch.zeros_like(p_x0).scatter_(-1, sorted_indices, nucleus_probs)
+    
+    assert move_chance_t.ndim == p_x0.ndim
+
+    alpha_t = (1 - move_chance_t)[0].item()
+    alpha_s = (1 - move_chance_s)[0].item()
+    if alpha_t > 0:
+      max_sigma = min(1, (1 - alpha_s) / alpha_t)
+    else:
+      max_sigma = 1
+    
+    eta = conf.softmax(dim=-1)
+    masked_flag = (x == self.mask_index).to(torch.bool)
+    eta[masked_flag] = 0
+    sigma = eta * max_sigma
+
+    q_xs = p_x0 * (1 - sigma[:, :, None])
+    q_xs[..., self.mask_index] = sigma
+    q_xs_2 = p_x0 * ((alpha_s - (1 - sigma[:, :, None]) * alpha_t) / (1 - alpha_t))
+    q_xs_2[..., self.mask_index] = (1 - alpha_s - sigma * alpha_t) / (1 - alpha_t)
+    copy_flag = (x != self.mask_index).to(torch.bool)
+    q_xs = torch.where(copy_flag.unsqueeze(-1), q_xs, q_xs_2)
+    xs = _sample_categorical(q_xs)
+
+    # update conf
+    unmask_mask = (x == self.mask_index) & (xs != self.mask_index)
+    batch_indices = torch.arange(xs.shape[0])[:, None]
+    feature_indices = torch.arange(xs.shape[1])
+    conf_values = - p_x0[batch_indices, feature_indices, xs]
+    conf[unmask_mask] = conf_values[unmask_mask]
+
+    remask_mask = (x != self.mask_index) & (xs == self.mask_index)
+    conf[remask_mask] = -torch.inf
+
+    if torch.allclose(xs, x) and not self.time_conditioning:
+      p_x0_cache = p_x0
+    else:
+      p_x0_cache = None
+
+    return p_x0_cache, xs, nfe, conf
+
+  def _h_condition_update(self, x, t, dt, p_x0=None, nfe=0, conf=None):
+    assert self.config.noise.type == 'loglinear'
+    sigma_t, _ = self.noise(t)
+    if t.ndim > 1:
+      t = t.squeeze(-1)
+    assert t.ndim == 1
+    move_chance_t = t[:, None, None]
+    move_chance_s = (t - dt)[:, None, None]
+    assert move_chance_t.ndim == 3
+    if p_x0 is None:
+      p_x0 = self.forward(x, sigma_t).exp()
+      nfe += 1
+      if self.config.sampling.nucleus_p < 1:
+        sorted_probs, sorted_indices = torch.sort(p_x0, descending=True, dim=-1)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        top_p_mask = cumulative_probs <= self.config.sampling.nucleus_p
+        top_p_mask[..., 0] = True
+        nucleus_probs = sorted_probs * top_p_mask
+        nucleus_probs /= nucleus_probs.sum(dim=-1, keepdim=True)
+        p_x0 = torch.zeros_like(p_x0).scatter_(-1, sorted_indices, nucleus_probs)
+    
+    assert move_chance_t.ndim == p_x0.ndim
+
+    probabilities = p_x0.clamp(min=1e-8, max=1.0)
+    entropies = -torch.sum(probabilities * torch.log(probabilities), dim=-1)
+
+    alpha_t = (1 - move_chance_t)[0].item()
+    alpha_s = (1 - move_chance_s)[0].item()
+    if alpha_t > 0:
+      max_sigma = min(self.config.sampling.eta, (1 - alpha_s) / alpha_t)
+    else:
+      max_sigma = self.config.sampling.eta
+    
+    eta = conf.softmax(dim=-1)
+    masked_flag = (x == self.mask_index).to(torch.bool)
+    eta[masked_flag] = 0
+    sigma = eta * max_sigma
+
+    q_xs = p_x0 * (1 - sigma[:, :, None])
+    q_xs[..., self.mask_index] = sigma
+    q_xs_2 = p_x0 * ((alpha_s - (1 - sigma[:, :, None]) * alpha_t) / (1 - alpha_t))
+    q_xs_2[..., self.mask_index] = (1 - alpha_s - sigma * alpha_t) / (1 - alpha_t)
+    copy_flag = (x != self.mask_index).to(torch.bool)
+    q_xs = torch.where(copy_flag.unsqueeze(-1), q_xs, q_xs_2)
+    xs = _sample_categorical(q_xs)
+
+    # update conf
+    unmask_mask = (x == self.mask_index) & (xs != self.mask_index)
+    conf[unmask_mask] = entropies[unmask_mask]
+
+    remask_mask = (x != self.mask_index) & (xs == self.mask_index)
+    conf[remask_mask] = -torch.inf
+
+    if torch.allclose(xs, x) and not self.time_conditioning:
+      p_x0_cache = p_x0
+    else:
+      p_x0_cache = None
+
+    return p_x0_cache, xs, nfe, conf
+  
+  def _ar_distill_update(self, x, t, dt, p_x0=None, eval_model=None):
+    assert self.config.noise.type == 'loglinear'
+    sigma_t, _ = self.noise(t)
+    if t.ndim > 1:
+      t = t.squeeze(-1)
+    assert t.ndim == 1
+    move_chance_t = t[:, None, None]
+    move_chance_s = (t - dt)[:, None, None]
+    assert move_chance_t.ndim == 3
     if p_x0 is None:
       p_x0 = self.forward(x, sigma_t).exp()
       if self.config.sampling.nucleus_p < 1:
@@ -614,11 +871,41 @@ class Diffusion(L.LightningModule):
     
     assert move_chance_t.ndim == p_x0.ndim
 
-    q_xs = p_x0 * (move_chance_t - move_chance_s)
-    q_xs[:, :, self.mask_index] = move_chance_s[:, :, 0]
-    _x = _sample_categorical(q_xs)
-    copy_flag = (x != self.mask_index).to(x.dtype)
-    xs = copy_flag * x + (1 - copy_flag) * _x
+    # first_mask = (x == 50257).cumsum(-1) == 0
+    # x_gpt2 = x.clone()
+    # logits = eval_model(x_gpt2, attention_mask=first_mask.float())[0]
+    # logits = logits.transpose(-1, -2)
+    # nlls = F.cross_entropy(logits[..., :-1], x_gpt2[..., 1:], reduction='none')
+    # concat_nlls = torch.cat([torch.zeros((1, 1)).to(self.device).float(), nlls], dim=-1)
+    # eta[first_mask] = torch.where(concat_nlls[first_mask] < 10, torch.tensor(1.0), torch.tensor(0))
+
+    if self.config.sampling.mask1:
+      eta = torch.ones_like(x).to(self.device).float()
+    else:
+      eta = torch.ones_like(x).to(self.device).float() * self.config.sampling.eta
+
+    logits = eval_model(x).logits
+    gpt2_conf = logits.gather(dim=2, index=x.unsqueeze(-1)).squeeze(-1)
+    masked_mask = x == 50257
+    gpt2_conf[masked_mask] = -torch.inf
+    
+    for i in range(x.shape[0]):
+      if torch.sum(gpt2_conf[i, :] > -torch.inf) > 0:
+        eta[i, :] = gpt2_conf[i, :].softmax(dim=-1) / (1 / (1 - self.config.sampling.eta)) + self.config.sampling.eta
+    
+    if self.config.sampling.mask1:
+      eta[masked_mask] = 1
+    eta = eta.unsqueeze(-1)  
+
+    alpha_s = 1 - move_chance_s
+    alpha_t = 1 - move_chance_t
+    coef1 = alpha_s - alpha_t * eta * (1 - alpha_s) / (1 - alpha_t)
+    coef2 = eta * (1 - alpha_s) / (1 - alpha_t)
+    x_one_hot = F.one_hot(x, self.vocab_size)
+    coef3 = (1 - eta) * (1 - alpha_s)
+    m_one_hot = F.one_hot(torch.ones_like(x, device=self.device) * 50257, self.vocab_size)
+    q_xs = coef1 * p_x0 + coef2 * x_one_hot + coef3 * m_one_hot
+    xs = _sample_categorical(q_xs)
 
     if torch.allclose(xs, x) and not self.time_conditioning:
       p_x0_cache = p_x0
@@ -626,6 +913,217 @@ class Diffusion(L.LightningModule):
       p_x0_cache = None
 
     return p_x0_cache, xs
+  
+
+  def _new_update(self, x, t, dt, nfe, p_x0=None):
+    assert self.config.noise.type == 'loglinear'
+    sigma_t, _ = self.noise(t)
+    if t.ndim > 1:
+      t = t.squeeze(-1)
+    assert t.ndim == 1
+    if t[0].item() > 0.55:
+      move_chance_t = (2 * t - 1)[:, None, None]
+      move_chance_s = (2 * (t - dt) - 1)[:, None, None]
+    elif t[0].item() <= 0.05:
+      move_chance_t = (2 * t)[:, None, None]
+      move_chance_s = (2 * (t - dt))[:, None, None]
+    else:
+      move_chance_s, move_chance_t = None, None
+    if p_x0 is None:
+      p_x0 = self.forward(x, sigma_t).exp()
+      nfe += 1
+      if self.config.sampling.nucleus_p < 1:
+        sorted_probs, sorted_indices = torch.sort(p_x0, descending=True, dim=-1)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        top_p_mask = cumulative_probs <= self.config.sampling.nucleus_p
+        top_p_mask[..., 0] = True
+        nucleus_probs = sorted_probs * top_p_mask
+        nucleus_probs /= nucleus_probs.sum(dim=-1, keepdim=True)
+        p_x0 = torch.zeros_like(p_x0).scatter_(-1, sorted_indices, nucleus_probs)
+
+    if t[0].item() > 0.55 or t[0].item() <= 0.05:
+      q_xs = p_x0 * (move_chance_t - move_chance_s)
+      q_xs[:, :, self.mask_index] = move_chance_s[:, :, 0]
+      _x = _sample_categorical(q_xs)
+      copy_flag = (x != self.mask_index).to(x.dtype)
+      xs = copy_flag * x + (1 - copy_flag) * _x
+    else:
+      sigma = self.config.sampling.eta
+      q_xs = p_x0 * (1 - sigma)
+      q_xs[..., self.mask_index] = sigma
+      q_xs_2 = p_x0 * ((0.9 - (1 - sigma) * 0.9) / (1 - 0.9))
+      q_xs_2[..., self.mask_index] = (1 - 0.9 - 0.9 * sigma) / (1 - 0.9)
+      copy_flag = (x != self.mask_index).to(torch.bool)
+      q_xs = torch.where(copy_flag.unsqueeze(-1), q_xs, q_xs_2)
+      xs = _sample_categorical(q_xs)
+      # if not torch.allclose(q_xs.sum(dim=-1), torch.ones_like(xs).to(q_xs.dtype)):
+      #   import ipdb
+      #   ipdb.set_trace()
+
+    if torch.allclose(xs, x) and not self.time_conditioning:
+      p_x0_cache = p_x0
+    else:
+      p_x0_cache = None
+
+    return p_x0_cache, xs, nfe
+
+  def _ddpm_caching_update(self, x, t, dt, p_x0=None, nfe=0, conf=None):
+    assert self.config.noise.type == 'loglinear'
+    sigma_t, _ = self.noise(t)
+    if t.ndim > 1:
+      t = t.squeeze(-1)
+    assert t.ndim == 1
+    move_chance_t = t[:, None, None]
+    move_chance_s = (t - dt)[:, None, None]
+    assert move_chance_t.ndim == 3
+    if p_x0 is None:
+      p_x0 = self.forward(x, sigma_t).exp()
+      nfe += 1
+      # log_p_x0 = self.forward(x, sigma_t)
+      # p_x0 = F.softmax(log_p_x0 / self.config.sampling.temperature, dim=-1)
+      if self.config.sampling.nucleus_p < 1:
+        sorted_probs, sorted_indices = torch.sort(p_x0, descending=True, dim=-1)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        top_p_mask = cumulative_probs <= self.config.sampling.nucleus_p
+        top_p_mask[..., 0] = True
+        nucleus_probs = sorted_probs * top_p_mask
+        nucleus_probs /= nucleus_probs.sum(dim=-1, keepdim=True)
+        p_x0 = torch.zeros_like(p_x0).scatter_(-1, sorted_indices, nucleus_probs)
+    
+    assert move_chance_t.ndim == p_x0.ndim
+
+    # conf_coef = conf.clone()
+    # conf_coef = 0.97 + 0.03 * conf_coef
+    # eta = torch.ones_like(x, device=self.device) * conf_coef
+    # eta[x == 50257] = 1
+    # eta = eta.unsqueeze(-1)
+    if self.config.sampling.sampler == 'mdim-const':
+      alpha_t = (1 - move_chance_t)[0].item()
+      alpha_s = (1 - move_chance_s)[0].item()
+      if alpha_t > 0:
+        sigma = min(self.config.sampling.eta, (1 - alpha_s) / alpha_t)
+      else:
+        sigma = self.config.sampling.eta
+      q_xs = p_x0 * (1 - sigma)
+      q_xs[..., self.mask_index] = sigma
+      q_xs_2 = p_x0 * ((alpha_s - (1 - sigma) * alpha_t) / (1 - alpha_t))
+      q_xs_2[..., self.mask_index] = (1 - alpha_s - sigma * alpha_t) / (1 - alpha_t)
+      copy_flag = (x != self.mask_index).to(torch.bool)
+      q_xs = torch.where(copy_flag.unsqueeze(-1), q_xs, q_xs_2)
+      xs = _sample_categorical(q_xs)
+    elif self.config.sampling.sampler == 'mdim-constmax':
+      alpha_t = (1 - move_chance_t)[0].item()
+      alpha_s = (1 - move_chance_s)[0].item()
+      if alpha_t > 0:
+        sigma_max = min(1, (1 - alpha_s) / alpha_t)
+      else:
+        sigma_max = 1
+      sigma = self.config.sampling.eta * sigma_max
+      q_xs = p_x0 * (1 - sigma)
+      q_xs[..., self.mask_index] = sigma
+      q_xs_2 = p_x0 * ((alpha_s - (1 - sigma) * alpha_t) / (1 - alpha_t))
+      q_xs_2[..., self.mask_index] = (1 - alpha_s - sigma * alpha_t) / (1 - alpha_t)
+      copy_flag = (x != self.mask_index).to(torch.bool)
+      q_xs = torch.where(copy_flag.unsqueeze(-1), q_xs, q_xs_2)
+      xs = _sample_categorical(q_xs)
+    elif self.config.sampling.sampler == 'mdim-linear':
+      alpha_t = (1 - move_chance_t)[0].item()
+      alpha_s = (1 - move_chance_s)[0].item()
+      if alpha_t > 0:
+        sigma = min(self.config.sampling.eta * t[0].item(), (1 - alpha_s) / alpha_t)
+      else:
+        sigma = self.config.sampling.eta * t[0].item()
+      q_xs = p_x0 * (1 - sigma)
+      q_xs[..., self.mask_index] = sigma
+      q_xs_2 = p_x0 * ((alpha_s - (1 - sigma) * alpha_t) / (1 - alpha_t))
+      q_xs_2[..., self.mask_index] = (1 - alpha_s - sigma * alpha_t) / (1 - alpha_t)
+      copy_flag = (x != self.mask_index).to(torch.bool)
+      q_xs = torch.where(copy_flag.unsqueeze(-1), q_xs, q_xs_2)
+      xs = _sample_categorical(q_xs)
+    elif self.config.sampling.sampler == 'mdim-position-condition-double':
+      eta1 = (torch.arange(1, 1025) / (1024 / (1 - self.config.sampling.eta)) + self.config.sampling.eta).to(self.device)
+      eta2 = torch.flip(eta1, dims=[0])
+      eta1 = torch.tile(eta1, (x.shape[0], 1))
+      eta2 = torch.tile(eta2, (x.shape[0], 1))
+      eta = torch.where(x == 50257, eta1, eta2)[:, :, None]
+      alpha_s = 1 - move_chance_s
+      alpha_t = 1 - move_chance_t
+      coef1 = alpha_s - alpha_t * eta * (1 - alpha_s) / (1 - alpha_t)
+      coef2 = eta * (1 - alpha_s) / (1 - alpha_t)
+      x_one_hot = F.one_hot(x, self.vocab_size)
+      coef3 = (1 - eta) * (1 - alpha_s)
+      m_one_hot = F.one_hot(torch.ones_like(x, device=self.device) * 50257, self.vocab_size)
+      q_xs = coef1 * p_x0 + coef2 * x_one_hot + coef3 * m_one_hot
+      xs = _sample_categorical(q_xs)
+    elif self.config.sampling.sampler == 'mdim-position-condition':
+      eta = (torch.arange(1, 1025) / (1024 / (1 - self.config.sampling.eta)) + self.config.sampling.eta).to(self.device)
+      eta = torch.tile(eta, (x.shape[0], 1))[:, :, None]
+      alpha_s = 1 - move_chance_s
+      alpha_t = 1 - move_chance_t
+      coef1 = alpha_s - alpha_t * eta * (1 - alpha_s) / (1 - alpha_t)
+      coef2 = eta * (1 - alpha_s) / (1 - alpha_t)
+      x_one_hot = F.one_hot(x, self.vocab_size)
+      coef3 = (1 - eta) * (1 - alpha_s)
+      m_one_hot = F.one_hot(torch.ones_like(x, device=self.device) * 50257, self.vocab_size)
+      q_xs = coef1 * p_x0 + coef2 * x_one_hot + coef3 * m_one_hot
+      xs = _sample_categorical(q_xs)
+
+    # MDLM
+    if self.config.sampling.sampler in ['mdlm', 'forward-backward']:
+      q_xs = p_x0 * (move_chance_t - move_chance_s)
+      q_xs[:, :, self.mask_index] = move_chance_s[:, :, 0]
+      _x = _sample_categorical(q_xs)
+      copy_flag = (x != self.mask_index).to(x.dtype)
+      xs = copy_flag * x + (1 - copy_flag) * _x
+
+    # mask = (xs != 50257) & (x == 50257)
+    # batch_indices = torch.arange(xs.shape[0])[:, None]
+    # feature_indices = torch.arange(xs.shape[1])
+    # conf_values = p_x0[batch_indices, feature_indices, xs]
+    # conf[mask] = conf_values[mask]
+
+    if torch.allclose(xs, x) and not self.time_conditioning:
+      p_x0_cache = p_x0
+    else:
+      p_x0_cache = None
+
+    if self.config.sampling.sampler == 'forward-backward':
+      if (t[0] - 2 * dt) > 0 and t[0] < 1:
+        if p_x0_cache is None:
+          sigma_s, _ = self.noise(t - dt)
+          p_x0_corrector = self.forward(xs, sigma_s).exp()
+          nfe += 1
+        else:
+          p_x0_corrector = p_x0
+        if self.config.sampling.nucleus_p < 1:
+          sorted_probs, sorted_indices = torch.sort(p_x0_corrector, descending=True, dim=-1)
+          cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+          top_p_mask = cumulative_probs <= self.config.sampling.nucleus_p
+          top_p_mask[..., 0] = True
+          nucleus_probs = sorted_probs * top_p_mask
+          nucleus_probs /= nucleus_probs.sum(dim=-1, keepdim=True)
+          p_x0_corrector = torch.zeros_like(p_x0_corrector).scatter_(-1, sorted_indices, nucleus_probs)
+
+        alpha_s = 1 - move_chance_s
+        alpha_s_1 = 1 - (move_chance_s - dt)
+        coef1 = ((alpha_s_1 - alpha_s) / (1 - alpha_s)).item()
+        q_xs = p_x0_corrector * coef1
+        q_xs[..., self.mask_index] = 1 - coef1
+        coef2 = (2 - alpha_s_1 / alpha_s).item()
+        q_xs_2 = p_x0_corrector * coef2
+        q_xs_2[..., self.mask_index] = 1 - coef2
+        mask_flag = (xs == self.mask_index).to(torch.bool)
+        q_xs = torch.where(mask_flag.unsqueeze(-1), q_xs, q_xs_2)
+        new_xs = _sample_categorical(q_xs)
+
+        if torch.allclose(xs, new_xs) and not self.time_conditioning:
+          p_x0_cache = p_x0_corrector
+        else:
+          p_x0_cache = None
+
+        return p_x0_cache, new_xs, nfe, conf
+
+    return p_x0_cache, xs, nfe, conf
 
   def _ddpm_update(self, x, t, dt):
     sigma_t, _ = self.noise(t)
@@ -656,28 +1154,70 @@ class Diffusion(L.LightningModule):
 
   def _ar_sampler(self, bsz):
     # precompute token buffer
-    num_pred_tokens = self.config.model.length - 1
+    num_pred_tokens = self.config.model.length - 2
     x = torch.zeros(
-      (bsz, num_pred_tokens + 1),
+      (bsz, num_pred_tokens + 2),
       dtype=torch.long,
       device=self.device)
     x[:, 0] = self.tokenizer.bos_token_id
     # precompute noise
     noise = (torch.distributions.Gumbel(0, 1)
              .sample((bsz, num_pred_tokens, self.vocab_size))
-             .to(self.device))
+             .to(self.device)).to(torch.float64)
     for i in range(num_pred_tokens):
       next_logits = self.forward(x[:, :i + 1], None)[:, -1]
+      if self.config.sampling.nucleus_p < 1:
+        p_x0 = next_logits.exp()
+        sorted_probs, sorted_indices = torch.sort(p_x0, descending=True, dim=-1)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        top_p_mask = cumulative_probs <= self.config.sampling.nucleus_p
+        top_p_mask[..., 0] = True
+        nucleus_probs = sorted_probs * top_p_mask
+        nucleus_probs /= nucleus_probs.sum(dim=-1, keepdim=True)
+        p_x0 = torch.zeros_like(p_x0).scatter_(-1, sorted_indices, nucleus_probs)
+        next_logits = p_x0.log()
       y = (next_logits + noise[:, i]).argmax(-1)
       x[:, i + 1] = y
+    x[:, self.config.model.length - 1] = 50256
     return x
+  
+  def _ar_infill(self, x, bsz):
+    # precompute token buffer
+    num_pred_tokens = 511
+    # precompute noise
+    noise = (torch.distributions.Gumbel(0, 1)
+             .sample((bsz, num_pred_tokens, self.vocab_size))
+             .to(self.device)).to(torch.float64)
+    for i in range(511, 511 + num_pred_tokens):
+      next_logits = self.forward(x[:, :i + 1], None)[:, -1]
+      # if self.config.sampling.nucleus_p < 1:
+      #   p_x0 = next_logits.exp()
+      #   sorted_probs, sorted_indices = torch.sort(p_x0, descending=True, dim=-1)
+      #   cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+      #   top_p_mask = cumulative_probs <= self.config.sampling.nucleus_p
+      #   top_p_mask[..., 0] = True
+      #   nucleus_probs = sorted_probs * top_p_mask
+      #   nucleus_probs /= nucleus_probs.sum(dim=-1, keepdim=True)
+      #   p_x0 = torch.zeros_like(p_x0).scatter_(-1, sorted_indices, nucleus_probs)
+      #   next_logits = p_x0.log()
+      y = (next_logits + noise[:, i - 511]).argmax(-1)
+      x[:, i + 1] = y
+    x[:, 1023] = 50256
+    return x
+  
+  @torch.no_grad()
+  def _infill(self, x, num_steps=None, eps=1e-5):
+    """Generate samples from the model."""
+    batch_size_per_gpu = self.config.loader.eval_batch_size
+    if self.parameterization == 'ar':
+      return self._ar_infill(x, batch_size_per_gpu), 0
 
   @torch.no_grad()
   def _sample(self, num_steps=None, eps=1e-5):
     """Generate samples from the model."""
     batch_size_per_gpu = self.config.loader.eval_batch_size
     if self.parameterization == 'ar':
-      return self._ar_sampler(batch_size_per_gpu)
+      return self._ar_sampler(batch_size_per_gpu), 0
     # Lightning auto-casting is not working in this method for some reason
     if num_steps is None:
       num_steps = self.config.sampling.steps
@@ -689,27 +1229,93 @@ class Diffusion(L.LightningModule):
     dt = (1 - eps) / num_steps
     p_x0_cache = None
 
-    for i in tqdm(range(num_steps)):
-      t = timesteps[i] * torch.ones(
-        x.shape[0], 1, device=self.device)
-      if self.sampler == 'ddpm':
-        x = self._ddpm_update(x, t, dt)
-      elif self.sampler == 'ddpm_cache':
-        p_x0_cache, x_next = self._ddpm_caching_update(
-          x, t, dt, p_x0=p_x0_cache)
+    if self.sampler == 'ar_distill':
+      eval_model = transformers.AutoModelForCausalLM.from_pretrained(
+        self.gen_ppl_eval_model_name_or_path).eval()
+      eval_model = eval_model.to(self.device)
+      eval_model.resize_token_embeddings(len(self.tokenizer))
+
+    nfe = 0
+    timestep = 1
+    min_t = timesteps[-1].item()
+    confident_score = - torch.ones_like(x, device=self.device).to(torch.bfloat16) * torch.inf
+    if self.config.sampling.dfm:
+      while timestep > dt:
+        t = timestep * torch.ones(x.shape[0], 1, device=self.device)
+        p_x0_cache, x_next, timestep, nfe = self._dfm_caching_update(
+          x, t, p_x0=p_x0_cache, nfe=nfe)
         x = x_next
-      else:
-        x = self._analytic_update(x, t, dt)
+      min_t = timestep
+    else:
+      pbar = tqdm(range(num_steps))
+      for i in pbar:
+        t = timesteps[i] * torch.ones(
+          x.shape[0], 1, device=self.device)
+        if self.sampler == 'ddpm':
+          x = self._ddpm_update(x, t, dt)
+        elif self.sampler == 'new':
+          p_x0_cache, x_next, nfe = self._new_update(x, t, dt, nfe, p_x0=p_x0_cache)
+          x = x_next
+        elif self.sampler == 'mask-predict':
+          x_next, confident_score = self._mask_predict_update(x, t, dt, conf=confident_score)
+          x = x_next
+        elif self.sampler == 'ar_distill':
+          p_x0_cache, x_next = self._ar_distill_update(
+            x, t, dt, p_x0=p_x0_cache, eval_model=eval_model)
+          x = x_next
+        elif self.sampler == 'probability_condition':
+          p_x0_cache, x_next, nfe, confident_score = self._p_condition_update(x, t, dt, p_x0=p_x0_cache, nfe=nfe, conf=confident_score)
+          x = x_next
+        elif self.sampler == 'entropy_condition':
+          p_x0_cache, x_next, nfe, confident_score = self._h_condition_update(x, t, dt, p_x0=p_x0_cache, nfe=nfe, conf=confident_score)
+          x = x_next
+        elif self.sampler == 'ddpm_cache':
+          p_x0_cache, x_next, nfe, confident_score = self._ddpm_caching_update(
+            x, t, dt, p_x0=p_x0_cache, nfe=nfe, conf=confident_score)
+          # if (not torch.allclose(x_next, x)
+          #     or self.time_conditioning):
+          #   # Disable caching
+          #   p_x0_cache = None
+          x = x_next
+        else:
+          x = self._analytic_update(x, t, dt)
+
+        pbar.set_postfix({'NFEs': nfe})
+
+    # logits = eval_model(x, attention_mask=attn_mask)[0]
+    # logits = logits.transpose(-1, -2)
+    # nlls = F.cross_entropy(logits[..., :-1], x[..., 1:], reduction='none')
 
     if self.config.sampling.noise_removal:
-      t = timesteps[-1] * torch.ones(x.shape[0], 1,
+      t = min_t * torch.ones(x.shape[0], 1,
                                      device=self.device)
       if self.sampler == 'analytic':
         x = self._denoiser_update(x, t)
       else:
         unet_conditioning = self.noise(t)[0]
         x = self.forward(x, unet_conditioning).argmax(dim=-1)
-    return x
+    return x, nfe
+
+  def restore_model_and_infill(self, x, num_steps, eps=1e-5):
+    """Generate samples from the model."""
+    # Lightning auto-casting is not working in this method for some reason
+    if self.ema:
+      self.ema.store(itertools.chain(
+        self.backbone.parameters(),
+        self.noise.parameters()))
+      self.ema.copy_to(itertools.chain(
+        self.backbone.parameters(),
+        self.noise.parameters()))
+    self.backbone.eval()
+    self.noise.eval()
+    samples, nfe = self._infill(x, num_steps=num_steps, eps=eps)
+    if self.ema:
+      self.ema.restore(itertools.chain(
+        self.backbone.parameters(),
+        self.noise.parameters()))
+    self.backbone.train()
+    self.noise.train()
+    return samples, nfe
 
   def restore_model_and_sample(self, num_steps, eps=1e-5):
     """Generate samples from the model."""
@@ -723,17 +1329,18 @@ class Diffusion(L.LightningModule):
         self.noise.parameters()))
     self.backbone.eval()
     self.noise.eval()
-    samples = self._sample(num_steps=num_steps, eps=eps)
+    samples, nfe = self._sample(num_steps=num_steps, eps=eps)
     if self.ema:
       self.ema.restore(itertools.chain(
         self.backbone.parameters(),
         self.noise.parameters()))
     self.backbone.train()
     self.noise.train()
-    return samples
+    return samples, nfe
 
   def get_score(self, x, sigma):
     model_output = self.forward(x, sigma)
+    p_x0 = model_output.exp()
     if self.parameterization == 'subs':
       # score(x, t) = p_t(y) / p_t(x)
       # => log score(x, t) = log p_t(y) - log p_t(x)
@@ -775,7 +1382,7 @@ class Diffusion(L.LightningModule):
       model_output = (
         masked_score * masked_indices
         + unmasked_score * (1 - masked_indices))
-    return model_output.exp()
+    return p_x0
 
   def _staggered_score(self, score, dsigma):
     score = score.clone()
@@ -791,6 +1398,14 @@ class Diffusion(L.LightningModule):
     score = self.get_score(x, curr_sigma)
     stag_score = self._staggered_score(score, dsigma)
     probs = stag_score * self._transp_transition(x, dsigma)
+    if self.config.sampling.nucleus_p < 1:
+      sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+      cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+      top_p_mask = cumulative_probs <= self.config.sampling.nucleus_p
+      top_p_mask[..., 0] = True
+      nucleus_probs = sorted_probs * top_p_mask
+      nucleus_probs /= nucleus_probs.sum(dim=-1, keepdim=True)
+      probs = torch.zeros_like(probs).scatter_(-1, sorted_indices, nucleus_probs)
     return _sample_categorical(probs)
 
   def _denoiser_update(self, x, t):
@@ -903,7 +1518,7 @@ class Diffusion(L.LightningModule):
     if self.change_of_variables or self.importance_sampling:
       return log_p_theta * torch.log1p(
         - torch.exp(- self.noise.sigma_min))
-    
+
     return - log_p_theta * (
       dsigma / torch.expm1(sigma))[:, None]
 

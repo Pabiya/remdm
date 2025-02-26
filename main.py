@@ -12,6 +12,9 @@ import dataloader
 import diffusion
 import utils
 
+import json
+import mauve
+
 omegaconf.OmegaConf.register_new_resolver(
   'cwd', os.getcwd)
 omegaconf.OmegaConf.register_new_resolver(
@@ -93,28 +96,51 @@ def generate_samples(config, logger, tokenizer):
     model.ema = None
   stride_length = config.sampling.stride_length
   num_strides = config.sampling.num_strides
+
+  samples = []
+  entropies = []
   for _ in range(config.sampling.num_sample_batches):
+    print("Starting Batch ", _)
     if config.sampling.semi_ar:
       _, intermediate_samples, _ = model.restore_model_and_semi_ar_sample(
         stride_length=stride_length,
         num_strides=num_strides,
         dt=1 / config.sampling.steps)
-      text_samples = intermediate_samples[-1]
+      samples = intermediate_samples[-1]
       # Note: Samples generated using semi-ar method
       # need to to be processed before computing generative perplexity
       # since these samples contain numerous <|endoftext|> tokens
       # and diffusion.compute_generative_perplexity() discards
       # any text after the first EOS token.
     else:
-      samples = model.restore_model_and_sample(
+      sample = model.restore_model_and_sample(
         num_steps=config.sampling.steps)
-      text_samples = model.tokenizer.batch_decode(samples)
-      model.compute_generative_perplexity(text_samples)
-  print('Text samples:', text_samples)
-  if not config.sampling.semi_ar:
-    print('Generative perplexity:',
-          model.gen_ppl_metric.compute())
-  return text_samples
+      for i in range(config.loader.batch_size):
+        row = sample[i]
+        counts = torch.unique(row, return_counts=True, sorted=True)[1]
+        entropies.append(torch.special.entr(counts.float() / counts.sum()).sum().item())
+
+        sample_text = tokenizer.batch_decode(row.unsqueeze(0))
+        samples.append(sample_text[0])
+
+  # compute generative perplexity
+  model.compute_generative_perplexity(samples)
+
+  # compute MAUVE score
+  human_references = []
+  _, valid_loader = dataloader.get_dataloaders(config, tokenizer, valid_seed=config.seed, skip_train=True)
+  for _ in range(config.sampling.num_sample_batches):    
+      batch = next(iter(valid_loader))
+      input_ids = batch['input_ids']
+      human_references.extend(tokenizer.batch_decode(input_ids))
+  assert len(samples) == len(human_references)
+  results = mauve.compute_mauve(p_text=human_references, q_text=samples, device_id=0, max_text_length=1024, verbose=False)
+  mauve_score = results.mauve
+
+  result_dict = {'gen_ppl': model.gen_ppl_metric.compute().cpu().item(), 'entropy': sum(entropies) / len(entropies), 'MAUVE': mauve_score, 'entropies': entropies, 'text_samples': samples}
+  with open(config.sampling.generated_seqs_path, "w") as file:
+      json.dump(result_dict, file, indent=4)
+  
 
 def _ppl_eval(config, logger, tokenizer):
   logger.info('Starting Zero Shot Eval.')
