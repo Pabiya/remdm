@@ -46,11 +46,15 @@ the following directory `./outputs/checkpoints`
 
 Below, we demonstrate how to generate text samples using different models and samplers. It should be as easy as running the following SLURM bash scripts.
 
+* AR
+```bash
+sbatch scripts/ar.sh
+```
+
 * MDLM
 ```bash
 sbatch scripts/mdlm.sh
 ```
-
 
 ### Acknowledgements
 This repository was built off of [MDLM] (https://github.com/kuleshov-group/mdlm) which was based on [SEDD](https://github.com/louaaron/Score-Entropy-Discrete-Diffusion).

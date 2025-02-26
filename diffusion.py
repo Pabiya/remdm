@@ -656,20 +656,31 @@ class Diffusion(L.LightningModule):
 
   def _ar_sampler(self, bsz):
     # precompute token buffer
-    num_pred_tokens = self.config.model.length - 1
+    num_pred_tokens = self.config.model.length - 2
     x = torch.zeros(
-      (bsz, num_pred_tokens + 1),
+      (bsz, num_pred_tokens + 2),
       dtype=torch.long,
       device=self.device)
     x[:, 0] = self.tokenizer.bos_token_id
     # precompute noise
     noise = (torch.distributions.Gumbel(0, 1)
              .sample((bsz, num_pred_tokens, self.vocab_size))
-             .to(self.device))
-    for i in range(num_pred_tokens):
+             .to(self.device)).to(torch.float64)
+    for i in tqdm(range(num_pred_tokens)):
       next_logits = self.forward(x[:, :i + 1], None)[:, -1]
+      if self.config.sampling.nucleus_p < 1:
+        p_x0 = next_logits.exp()
+        sorted_probs, sorted_indices = torch.sort(p_x0, descending=True, dim=-1)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        top_p_mask = cumulative_probs <= self.config.sampling.nucleus_p
+        top_p_mask[..., 0] = True
+        nucleus_probs = sorted_probs * top_p_mask
+        nucleus_probs /= nucleus_probs.sum(dim=-1, keepdim=True)
+        p_x0 = torch.zeros_like(p_x0).scatter_(-1, sorted_indices, nucleus_probs)
+        next_logits = p_x0.log()
       y = (next_logits + noise[:, i]).argmax(-1)
       x[:, i + 1] = y
+    x[:, self.config.model.length - 1] = self.tokenizer.bos_token_id
     return x
 
   @torch.no_grad()
