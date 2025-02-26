@@ -57,7 +57,7 @@ sbatch scripts/mdlm.sh
 ```
 
 ### Acknowledgements
-This repository was built off of [MDLM] (https://github.com/kuleshov-group/mdlm) which was based on [SEDD](https://github.com/louaaron/Score-Entropy-Discrete-Diffusion).
+This repository was built off of [MDLM](https://github.com/kuleshov-group/mdlm) which was based on [SEDD](https://github.com/louaaron/Score-Entropy-Discrete-Diffusion).
 
 ## Citation
 ```
