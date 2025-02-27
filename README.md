@@ -2,14 +2,14 @@
 
 [![arXiv](https://img.shields.io/badge/arXiv-2406.07524-red.svg)](https://arxiv.org/abs/2406.07524)
 [![deploy](https://img.shields.io/badge/Blog%20%20-8A2BE2)](https://remdm.github.io)
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/18nC6q7dWq154fI1BXPLwmtnS7Zvbrv6p?usp=sharing/)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/143sxeasXbmUIdROSXYQJLmSMIAhSZCPw?usp=sharing)
 
 ![graphical_abstract](./assets/graphical_abstract.png)
 
-We introduce *ReMDM*, a simple and general framework to design remasking samplers for masked discrete diffusion models. In this repo, we provide our implementation of different ReMDM strategies for unconditional text generation on OpenWebText. We also provide a demo in this [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/18nC6q7dWq154fI1BXPLwmtnS7Zvbrv6p?usp=sharing/) notebook showing how to download the MDLM checkpoint and implement ReMDM-loop on top of it.
+We introduce *ReMDM*, a simple and general framework to design remasking samplers for masked discrete diffusion models. In this repo, we provide our implementation of different ReMDM strategies for unconditional text generation on OpenWebText. We also provide a demo in this [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/143sxeasXbmUIdROSXYQJLmSMIAhSZCPw?usp=sharing) notebook showing how to download the MDLM checkpoint and implement ReMDM-loop on top of it.
 
 
-Our main add-ons from MDLM are:
+Our main add-ons to MDLM are:
 * **Evaluation Metrics**
   1. Add MAUVE computation code.
   2. Add entropy computation code.
