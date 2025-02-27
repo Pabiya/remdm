@@ -591,6 +591,69 @@ class Diffusion(L.LightningModule):
   def _sample_prior(self, *batch_dims):
     return self.mask_index * torch.ones(
       * batch_dims, dtype=torch.int64)
+  
+  def _dfm_caching_update(self, x, t, p_x0=None):
+    assert self.config.noise.type == 'loglinear'
+    sigma_t, _ = self.noise(t)
+    if t.ndim > 1:
+      t = t.squeeze(-1)
+    assert t.ndim == 1
+    timestep = t[0].item()
+    # Hard-coded corrector schecule, see Appendix D in https://proceedings.neurips.cc/paper_files/paper/2024/file/f0d629a734b56a642701bba7bc8bb3ed-Paper-Conference.pdf
+    at = 10 * timestep ** 0.25 * (1 - timestep) ** 0.25 + 1
+    bt = at - 1
+    if timestep == 1:
+      dt = 1 / self.config.sampling.steps
+    else:
+      dt = min(1 / self.config.sampling.steps, 1 / (at / timestep  + bt / (1 - timestep)))
+    move_chance_t = t[:, None, None]
+    move_chance_s = (t - dt)[:, None, None]
+    assert move_chance_t.ndim == 3
+    if p_x0 is None:
+      log_p_x0 = self.forward(x, sigma_t)
+      if self.config.sampling.nucleus_p < 1:
+        p_x0 = log_p_x0.exp()
+        sorted_probs, sorted_indices = torch.sort(p_x0, descending=True, dim=-1)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        top_p_mask = cumulative_probs <= self.config.sampling.nucleus_p
+        top_p_mask[..., 0] = True
+        nucleus_probs = sorted_probs * top_p_mask
+        nucleus_probs /= nucleus_probs.sum(dim=-1, keepdim=True)
+        p_x0 = torch.zeros_like(p_x0).scatter_(-1, sorted_indices, nucleus_probs)
+    
+    assert move_chance_t.ndim == p_x0.ndim
+
+    if timestep == 1:
+      q_xs = p_x0 * (move_chance_t - move_chance_s)
+      q_xs[:, :, self.mask_index] = move_chance_s[:, :, 0]
+      _x = _sample_categorical(q_xs)
+    
+      copy_flag = (x != self.mask_index).to(x.dtype)
+      xs = copy_flag * x + (1 - copy_flag) * _x
+      if torch.allclose(xs, x) and not self.time_conditioning:
+        p_x0_cache = p_x0
+      else:
+        p_x0_cache = None
+      return p_x0_cache, xs, timestep - dt
+
+    alpha_t = 1 - move_chance_t[0].item()
+    alpha_s = 1 - move_chance_s[0].item()
+    coef1 = at * (alpha_s - alpha_t) / (1 - alpha_t)
+    q_xs = p_x0 * coef1
+    q_xs[..., self.mask_index] = 1 - coef1
+    coef2 = 1 - bt * (alpha_s / alpha_t - 1)
+    q_xs2 = p_x0 * coef2
+    q_xs2[..., self.mask_index] = 1 - coef2
+    masked_flag = (x == self.mask_index).to(torch.bool)
+    q_xs = torch.where(masked_flag.unsqueeze(-1), q_xs, q_xs2)
+    xs = _sample_categorical(q_xs)
+  
+    if torch.allclose(xs, x) and not self.time_conditioning:
+      p_x0_cache = p_x0
+    else:
+      p_x0_cache = None
+
+    return p_x0_cache, xs, timestep - dt
 
   def _ddpm_caching_update(self, x, t, dt, p_x0=None, conf=None):
     assert self.config.noise.type == 'loglinear'
@@ -797,21 +860,30 @@ class Diffusion(L.LightningModule):
     dt = (1 - eps) / num_steps
     p_x0_cache = None
 
+    min_t = timesteps[-1].item()
     confident_score = - torch.ones_like(x, device=self.device).to(torch.bfloat16) * torch.inf
-    for i in tqdm(range(num_steps)):
-      t = timesteps[i] * torch.ones(
-        x.shape[0], 1, device=self.device)
-      if self.sampler == 'ddpm':
-        x = self._ddpm_update(x, t, dt)
-      elif self.sampler == 'ddpm_cache':
-        p_x0_cache, x_next, confident_score = self._ddpm_caching_update(
-          x, t, dt, p_x0=p_x0_cache, conf=confident_score)
+    if self.config.sampling.dfm:
+      timestep = 1
+      while timestep > dt:
+        t = timestep * torch.ones(x.shape[0], 1, device=self.device)
+        p_x0_cache, x_next, timestep = self._dfm_caching_update(x, t, p_x0=p_x0_cache)
         x = x_next
-      else:
-        x = self._analytic_update(x, t, dt)
+      min_t = timestep
+    else:
+      for i in tqdm(range(num_steps)):
+        t = timesteps[i] * torch.ones(
+          x.shape[0], 1, device=self.device)
+        if self.sampler == 'ddpm':
+          x = self._ddpm_update(x, t, dt)
+        elif self.sampler == 'ddpm_cache':
+          p_x0_cache, x_next, confident_score = self._ddpm_caching_update(
+            x, t, dt, p_x0=p_x0_cache, conf=confident_score)
+          x = x_next
+        else:
+          x = self._analytic_update(x, t, dt)
 
     if self.config.sampling.noise_removal:
-      t = timesteps[-1] * torch.ones(x.shape[0], 1,
+      t = min_t * torch.ones(x.shape[0], 1,
                                      device=self.device)
       if self.sampler == 'analytic':
         x = self._denoiser_update(x, t)

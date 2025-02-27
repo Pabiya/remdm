@@ -61,6 +61,11 @@ sbatch scripts/mdlm.sh
 sbatch scripts/fb.sh
 ```
 
+* Discrete flow matching corrector
+```bash
+sbatch scripts/dfm.sh
+```
+
 * ReMDM
 ```bash
 sbatch scripts/remdm-{YOUR-CHOSEN-STRATEGY}.sh
