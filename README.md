@@ -56,24 +56,14 @@ sbatch scripts/ar.sh
 sbatch scripts/mdlm.sh
 ```
 
-* ReMDM-cap
+* Forward-Backward corrector
 ```bash
-sbatch scripts/remdm-cap.sh
+sbatch scripts/fb.sh
 ```
 
-* ReMDM-rescale
+* ReMDM
 ```bash
-sbatch scripts/remdm-rescale.sh
-```
-
-* ReMDM-conf
-```bash
-sbatch scripts/remdm-conf.sh
-```
-
-* ReMDM-loop
-```bash
-sbatch scripts/remdm-loop.sh
+sbatch scripts/remdm-{YOUR-CHOSEN-STRATEGY}.sh
 ```
 
 ### Acknowledgements

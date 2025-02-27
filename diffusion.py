@@ -620,6 +620,20 @@ class Diffusion(L.LightningModule):
       _x = _sample_categorical(q_xs)
       copy_flag = (x != self.mask_index).to(x.dtype)
       xs = copy_flag * x + (1 - copy_flag) * _x
+    elif self.config.sampling.sampler == 'forward-backward':
+      alpha_t = (1 - move_chance_t)[0].item()
+      alpha_s = (1 - move_chance_s)[0].item()
+      if alpha_t > 0:
+        sigma = (alpha_s - alpha_t) / alpha_t
+      else:
+        sigma = 1
+      q_xs = p_x0 * (1 - sigma)
+      q_xs[..., self.mask_index] = sigma
+      q_xs_2 = p_x0 * ((alpha_s - (1 - sigma) * alpha_t) / (1 - alpha_t))
+      q_xs_2[..., self.mask_index] = (1 - alpha_s - sigma * alpha_t) / (1 - alpha_t)
+      copy_flag = (x != self.mask_index).to(torch.bool)
+      q_xs = torch.where(copy_flag.unsqueeze(-1), q_xs, q_xs_2)
+      xs = _sample_categorical(q_xs)
     elif self.config.sampling.sampler == 'remdm-cap':
       alpha_t = (1 - move_chance_t)[0].item()
       alpha_s = (1 - move_chance_s)[0].item()
