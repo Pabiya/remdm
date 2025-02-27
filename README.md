@@ -76,6 +76,14 @@ sbatch scripts/dfm.sh
 sbatch scripts/remdm-{YOUR-CHOSEN-STRATEGY}.sh
 ```
 
+To conduct your own hyperparameter search, change the following values in the bash scripts:
+1. sampling_steps: number of sample steps
+2. p: top-p value in nucleus sampling
+3. eta: $\eta$ value in different ReMDM strategies
+4. t_on: $t_{on}$ in ReMDM-loop
+5. t_off: $t_{off}$ in ReMDM-loop
+6. alpha_on: $\alpha(t_{on})$ in ReMDM-loop
+
 ### Acknowledgements
 This repository was built off of [MDLM](https://github.com/kuleshov-group/mdlm) which was based on [SEDD](https://github.com/louaaron/Score-Entropy-Discrete-Diffusion).
 
