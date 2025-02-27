@@ -51,6 +51,11 @@ Below, we demonstrate how to generate text samples using different models and sa
 sbatch scripts/ar.sh
 ```
 
+* SEDD
+```bash
+sbatch scripts/sedd.sh
+```
+
 * MDLM
 ```bash
 sbatch scripts/mdlm.sh
