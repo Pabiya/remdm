@@ -592,7 +592,7 @@ class Diffusion(L.LightningModule):
     return self.mask_index * torch.ones(
       * batch_dims, dtype=torch.int64)
 
-  def _ddpm_caching_update(self, x, t, dt, p_x0=None):
+  def _ddpm_caching_update(self, x, t, dt, p_x0=None, conf=None):
     assert self.config.noise.type == 'loglinear'
     sigma_t, _ = self.noise(t)
     if t.ndim > 1:
@@ -649,13 +649,39 @@ class Diffusion(L.LightningModule):
       copy_flag = (x != self.mask_index).to(torch.bool)
       q_xs = torch.where(copy_flag.unsqueeze(-1), q_xs, q_xs_2)
       xs = _sample_categorical(q_xs)
+    elif self.config.sampling.sampler == 'remdm-conf':
+      alpha_t = (1 - move_chance_t)[0].item()
+      alpha_s = (1 - move_chance_s)[0].item()
+      if alpha_t > 0:
+        sigma_max = min(1, (1 - alpha_s) / alpha_t)
+      else:
+        sigma_max = 1
+      eta = conf.softmax(dim=-1)
+      masked_flag = (x == self.mask_index).to(torch.bool)
+      eta[masked_flag] = 0
+      sigma = eta * sigma_max
+      q_xs = p_x0 * (1 - sigma[:, :, None])
+      q_xs[..., self.mask_index] = sigma
+      q_xs_2 = p_x0 * ((alpha_s - (1 - sigma[:, :, None]) * alpha_t) / (1 - alpha_t))
+      q_xs_2[..., self.mask_index] = (1 - alpha_s - sigma * alpha_t) / (1 - alpha_t)
+      copy_flag = (x != self.mask_index).to(torch.bool)
+      q_xs = torch.where(copy_flag.unsqueeze(-1), q_xs, q_xs_2)
+      xs = _sample_categorical(q_xs)
+      # update conf
+      unmask_mask = (x == self.mask_index) & (xs != self.mask_index)
+      batch_indices = torch.arange(xs.shape[0])[:, None]
+      feature_indices = torch.arange(xs.shape[1])
+      conf_values = - p_x0[batch_indices, feature_indices, xs]
+      conf[unmask_mask] = conf_values[unmask_mask]
+      remask_mask = (x != self.mask_index) & (xs == self.mask_index)
+      conf[remask_mask] = -torch.inf
 
     if torch.allclose(xs, x) and not self.time_conditioning:
       p_x0_cache = p_x0
     else:
       p_x0_cache = None
 
-    return p_x0_cache, xs
+    return p_x0_cache, xs, conf
 
   def _ddpm_update(self, x, t, dt):
     sigma_t, _ = self.noise(t)
@@ -730,14 +756,15 @@ class Diffusion(L.LightningModule):
     dt = (1 - eps) / num_steps
     p_x0_cache = None
 
+    confident_score = - torch.ones_like(x, device=self.device).to(torch.bfloat16) * torch.inf
     for i in tqdm(range(num_steps)):
       t = timesteps[i] * torch.ones(
         x.shape[0], 1, device=self.device)
       if self.sampler == 'ddpm':
         x = self._ddpm_update(x, t, dt)
       elif self.sampler == 'ddpm_cache':
-        p_x0_cache, x_next = self._ddpm_caching_update(
-          x, t, dt, p_x0=p_x0_cache)
+        p_x0_cache, x_next, confident_score = self._ddpm_caching_update(
+          x, t, dt, p_x0=p_x0_cache, conf=confident_score)
         x = x_next
       else:
         x = self._analytic_update(x, t, dt)

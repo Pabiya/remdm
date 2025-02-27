@@ -66,6 +66,11 @@ sbatch scripts/remdm-cap.sh
 sbatch scripts/remdm-rescale.sh
 ```
 
+* ReMDM-conf
+```bash
+sbatch scripts/remdm-conf.sh
+```
+
 ### Acknowledgements
 This repository was built off of [MDLM](https://github.com/kuleshov-group/mdlm) which was based on [SEDD](https://github.com/louaaron/Score-Entropy-Discrete-Diffusion).
 
