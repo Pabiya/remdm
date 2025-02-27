@@ -675,6 +675,33 @@ class Diffusion(L.LightningModule):
       conf[unmask_mask] = conf_values[unmask_mask]
       remask_mask = (x != self.mask_index) & (xs == self.mask_index)
       conf[remask_mask] = -torch.inf
+    elif self.config.sampling.sampler == 'remdm-loop':
+      time = t[0].item()
+      # compute alpha_t and alpha_s
+      if time > self.config.sampling.t_on:
+        move_chance_t = (1 - (1 - t) * self.config.sampling.alpha_on / (1 - self.config.sampling.t_on))[:, None, None]
+        move_chance_s = (1 - (1 - t + dt) * self.config.sampling.alpha_on / (1 - self.config.sampling.t_on))[:, None, None]
+      elif time <= self.config.sampling.t_off:
+        move_chance_t = (t * (1 - self.config.sampling.alpha_on) / self.config.sampling.t_off)[:, None, None]
+        move_chance_s = ((t - dt) * (1 - self.config.sampling.alpha_on) / self.config.sampling.t_off)[:, None, None]
+      else:
+        move_chance_t, move_chance_s = None, None
+      # use MDLM
+      if time > self.config.sampling.t_on or time <= self.config.sampling.t_off:
+        q_xs = p_x0 * (move_chance_t - move_chance_s)
+        q_xs[:, :, self.mask_index] = move_chance_s[:, :, 0]
+        _x = _sample_categorical(q_xs)
+        copy_flag = (x != self.mask_index).to(x.dtype)
+        xs = copy_flag * x + (1 - copy_flag) * _x
+      else: # use ReMDM
+        sigma = self.config.sampling.eta
+        q_xs = p_x0 * (1 - sigma)
+        q_xs[..., self.mask_index] = sigma
+        q_xs_2 = p_x0 * ((0.9 - (1 - sigma) * 0.9) / (1 - 0.9))
+        q_xs_2[..., self.mask_index] = (1 - 0.9 - 0.9 * sigma) / (1 - 0.9)
+        copy_flag = (x != self.mask_index).to(torch.bool)
+        q_xs = torch.where(copy_flag.unsqueeze(-1), q_xs, q_xs_2)
+        xs = _sample_categorical(q_xs)
 
     if torch.allclose(xs, x) and not self.time_conditioning:
       p_x0_cache = p_x0

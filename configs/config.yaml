@@ -39,6 +39,9 @@ sampling:
   nucleus_p: 1.0
   eta: 0
   sampler: mdlm
+  t_on: 0
+  t_off: 0
+  alpha_on: 0
 
 training:
   ema: 0.9999
