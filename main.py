@@ -140,6 +140,8 @@ def generate_samples(config, logger, tokenizer):
   result_dict = {'gen_ppl': model.gen_ppl_metric.compute().cpu().item(), 'entropy': sum(entropies) / len(entropies), 'MAUVE': mauve_score, 'entropies': entropies, 'text_samples': samples}
   with open(config.sampling.generated_seqs_path, "w") as file:
       json.dump(result_dict, file, indent=4)
+
+  return samples
   
 
 def _ppl_eval(config, logger, tokenizer):
