@@ -44,7 +44,7 @@ the following directory `./outputs/checkpoints`
 
 ## Reproducing Experiments
 
-Below, we demonstrate how to generate text samples using different models and samplers. It should be as easy as running the following SLURM bash scripts.
+Below, we demonstrate how to generate text samples using different models and samplers. It should be as easy as replacing the "YOUR-BASE-PATH" with your path to the repository and running the following SLURM bash scripts.
 
 * AR
 ```bash
@@ -54,6 +54,16 @@ sbatch scripts/ar.sh
 * MDLM
 ```bash
 sbatch scripts/mdlm.sh
+```
+
+* ReMDM-cap
+```bash
+sbatch scripts/remdm-cap.sh
+```
+
+* ReMDM-rescale
+```bash
+sbatch scripts/remdm-rescale.sh
 ```
 
 ### Acknowledgements

@@ -37,6 +37,8 @@ sampling:
   num_strides: 1
   generated_seqs_path: ''
   nucleus_p: 1.0
+  eta: 0
+  sampler: mdlm
 
 training:
   ema: 0.9999

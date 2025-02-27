@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -J mdlm                       # Job name
+#SBATCH -J remdm-rescale              # Job name
 #SBATCH -o watch_folder/%x_%j.out     # log file (out & err)
 #SBATCH -N 1                          # Total number of nodes requested
 #SBATCH --get-user-env                # retrieve the users login environment
@@ -12,11 +12,12 @@
 #SBATCH --open-mode=append            # Do not overwrite logs
 #SBATCH --requeue                     # Requeue upon preemption
 
-checkpoint_path=YOUR-BASE-PATH/remdm/outputs/checkpoints/mdlm.ckpt
+checkpoint_path=/share/kuleshov/gw354/remdm/outputs/checkpoints/mdlm.ckpt
 T=0
 sampling_steps=1024
 p=0.9
-generated_seqs_path=YOUR-BASE-PATH/remdm/outputs/mdlm_T-${sampling_steps}_topp-${p}.json
+eta=0.015
+generated_seqs_path=/share/kuleshov/gw354/remdm/outputs/remdm-rescale_T-${sampling_steps}_eta-${eta}_topp-${p}.json
 
 export HYDRA_FULL_ERROR=1
 
@@ -33,11 +34,12 @@ srun python -u -m main \
     eval.checkpoint_path=${checkpoint_path} \
     time_conditioning=false \
     +wandb.offline=true \
-    hydra.run.dir="${PWD}/outputs/mdlm" \
+    hydra.run.dir="${PWD}/outputs/remdm-rescale" \
     T=${T} \
     sampling.steps=${sampling_steps} \
     seed=1 \
-    sampling.num_sample_batches=5000 \
+    sampling.num_sample_batches=10 \
     sampling.generated_seqs_path=${generated_seqs_path} \
     sampling.nucleus_p=${p} \
-    sampling.sampler="mdlm"
+    sampling.sampler="remdm-rescale" \
+    sampling.eta=${eta} 
