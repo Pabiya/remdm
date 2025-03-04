@@ -31,6 +31,8 @@ To get started, create a conda environment containing the required dependencies.
 ```bash
 conda env create -f requirements.yaml
 conda activate remdm
+# install flash-attention separately
+pip install flash-attn==2.6.3
 ```
 
 Create the following directories to store saved models and slurm logs:
@@ -89,5 +91,10 @@ This repository was built off of [MDLM](https://github.com/kuleshov-group/mdlm) 
 
 ## Citation
 ```
-
+@article{wang2025remasking,
+  title={Remasking Discrete Diffusion Models with Inference-Time Scaling},
+  author={Wang, Guanghan and Schiff, Yair and Sahoo, Subham and Kuleshov, Volodymyr},
+  journal={arXiv preprint arXiv:2503.00307},
+  year={2025}
+}
 ```
