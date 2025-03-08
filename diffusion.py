@@ -774,8 +774,8 @@ class Diffusion(L.LightningModule):
         sigma = self.config.sampling.eta
         q_xs = p_x0 * (1 - sigma)
         q_xs[..., self.mask_index] = sigma
-        q_xs_2 = p_x0 * ((0.9 - (1 - sigma) * 0.9) / (1 - 0.9))
-        q_xs_2[..., self.mask_index] = (1 - 0.9 - 0.9 * sigma) / (1 - 0.9)
+        q_xs_2 = p_x0 * ((self.config.sampling.alpha_on - (1 - sigma) * self.config.sampling.alpha_on) / (1 - self.config.sampling.alpha_on))
+        q_xs_2[..., self.mask_index] = (1 - self.config.sampling.alpha_on - self.config.sampling.alpha_on * sigma) / (1 - self.config.sampling.alpha_on)
         copy_flag = (x != self.mask_index).to(torch.bool)
         q_xs = torch.where(copy_flag.unsqueeze(-1), q_xs, q_xs_2)
         xs = _sample_categorical(q_xs)
