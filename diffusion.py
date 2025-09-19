@@ -22,7 +22,7 @@ from tqdm import tqdm
 
 LOG2 = math.log(2)
 
-
+# 확률 분포에서 샘플을 뽑는 함수
 def _sample_categorical(categorical_probs):
   categorical_probs = categorical_probs.to(torch.float64)
   gumbel_norm = (
@@ -30,7 +30,7 @@ def _sample_categorical(categorical_probs):
     - (torch.rand_like(categorical_probs) + 1e-10).log())
   return (categorical_probs / gumbel_norm).argmax(dim=-1)
 
-
+# broadcasting이 가능하도록 x의 차원을 reference의 차원에 맞춰 확장함
 def _unsqueeze(x, reference):
   return x.view(
     * x.shape,
@@ -263,7 +263,7 @@ class Diffusion(L.LightningModule):
 
   def _subs_parameterization(self, logits, xt):
     # log prob at the mask index = - infinity
-    logits[:, :, self.mask_index] += self.neg_infinity
+    logits[:, :, self.mask_index] += self.neg_infinity # 마스크 토큰 출력하지 못하도록 확률을 0으로 강제한다
     
     # Normalize the logits such that x.exp() is
     # a probability distribution over vocab_size.
@@ -752,6 +752,44 @@ class Diffusion(L.LightningModule):
       conf[unmask_mask] = conf_values[unmask_mask]
       remask_mask = (x != self.mask_index) & (xs == self.mask_index)
       conf[remask_mask] = -torch.inf
+    elif self.config.sampling.sampler == 'remdm-ent':
+      # Entropy-aware remasking: use per-position entropy H as the confidence signal.
+      # 1) alpha_t, alpha_s, and theoretical cap sigma_max
+      alpha_t = (1 - move_chance_t)[0].item()
+      alpha_s = (1 - move_chance_s)[0].item()
+      if alpha_t > 0:
+        sigma_max = min(1, (1 - alpha_s) / alpha_t)
+      else:
+        sigma_max = 1
+
+      # 2) per-position entropy H from p_x0
+      eps = 1e-12
+      p = p_x0.clamp_min(eps)                          # (B, L, V)
+      if getattr(self.config.sampling, 'entropy_remove_mask_prob', True):
+        p_wo_mask = p.clone()
+        p_wo_mask[..., self.mask_index] = 0
+        Z = p_wo_mask.sum(dim=-1, keepdim=True).clamp_min(eps)
+        q = p_wo_mask / Z
+      else:
+        Z = p.sum(dim=-1, keepdim=True).clamp_min(eps)
+        q = p / Z
+      H = -(q * (q + eps).log()).sum(dim=-1)           # (B, L), natural log
+
+      # 3) map entropy to per-position mixing weight eta via softmax over positions
+      eta = torch.softmax(H, dim=-1)                   # (B, L)
+      masked_flag = (x == self.mask_index).to(torch.bool)
+      eta = eta.masked_fill(masked_flag, 0)            # do not allocate mass to already-masked positions
+
+      # 4) per-position sigma and categorical for x_s
+      sigma = eta * sigma_max                          # (B, L)
+      q_xs = p_x0 * (1 - sigma[:, :, None])
+      q_xs[..., self.mask_index] = sigma
+      q_xs_2 = p_x0 * ((alpha_s - (1 - sigma[:, :, None]) * alpha_t) / (1 - alpha_t))
+      q_xs_2[..., self.mask_index] = (1 - alpha_s - sigma * alpha_t) / (1 - alpha_t)
+      copy_flag = (x != self.mask_index).to(torch.bool)
+      q_xs = torch.where(copy_flag.unsqueeze(-1), q_xs, q_xs_2)
+      xs = _sample_categorical(q_xs)
+
     elif self.config.sampling.sampler == 'remdm-loop':
       time = t[0].item()
       # compute alpha_t and alpha_s
