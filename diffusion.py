@@ -683,6 +683,22 @@ class Diffusion(L.LightningModule):
       _x = _sample_categorical(q_xs)
       copy_flag = (x != self.mask_index).to(x.dtype)
       xs = copy_flag * x + (1 - copy_flag) * _x
+    elif self.config.sampling.sampler == 'mdlm-refine' or self.config.sampling.sampler == 'mdlm-refine-2':
+      # behave exactly like mdlm, but update the U/R trace (fu)
+      q_xs = p_x0 * (move_chance_t - move_chance_s)
+      q_xs[:, :, self.mask_index] = move_chance_s[:, :, 0]
+      _x = _sample_categorical(q_xs)
+      copy_flag = (x != self.mask_index).to(x.dtype)
+      xs = copy_flag * x + (1 - copy_flag) * _x
+
+      # if tracing requested, update the unmask/remask trackers
+      if getattr(self.config.sampling, "log_unmask_remask_order", False):
+        # make sure tracing state exists (it should be created in _sample init, but guard)
+        if not hasattr(self, "_umr"):
+          self._trace_unmask_remask_init(x)
+          self._ddpm_cache_step_idx = 0
+        self._trace_unmask_remask_update(x, xs)
+        self._ddpm_cache_step_idx += 1
     elif self.config.sampling.sampler == 'forward-backward':
       alpha_t = (1 - move_chance_t)[0].item()
       alpha_s = (1 - move_chance_s)[0].item()
@@ -790,6 +806,62 @@ class Diffusion(L.LightningModule):
       q_xs = torch.where(copy_flag.unsqueeze(-1), q_xs, q_xs_2)
       xs = _sample_categorical(q_xs)
 
+    elif self.config.sampling.sampler == 'remdm-ent-2':
+      # === 1) cap on per-position sigma (ReMDM cap / rescale 조건과 동일한 상한) ===
+      alpha_t = (1 - move_chance_t)[0].item()
+      alpha_s = (1 - move_chance_s)[0].item()
+      if alpha_t > 0:
+        sigma_max = min(1, (1 - alpha_s) / alpha_t)
+      else:
+        sigma_max = 1
+
+      # === 2) 언마스크-당시 캐시(conf)를 그대로 사용해 분배 η 계산 ===
+      #  - conf는 (B, L) 텐서로, 각 위치에 '언마스크될 당시'의 엔트로피가 저장됨
+      eta = conf.softmax(dim=-1)                 # (B, L)
+      masked_flag = (x == self.mask_index).to(torch.bool)
+      eta = eta.masked_fill(masked_flag, 0)      # 이미 [MASK]인 위치엔 분배하지 않음
+
+      if getattr(self.config.sampling, "print_prob_entropy_stats", False):
+        step_idx = int(getattr(self, "_ddpm_cache_step_idx", 0))
+        pe_every = int(getattr(self.config.sampling, "print_every", 1))
+        if step_idx % pe_every == 0:
+            self._print_prob_entropy_stats(p_x0, x, step=step_idx)
+
+      # === 3) per-position sigma로 q(x_s | x_t) 구성 후 샘플 ===
+      sigma = eta * sigma_max                    # (B, L)
+      q_xs = p_x0 * (1 - sigma[:, :, None])
+      q_xs[..., self.mask_index] = sigma
+      q_xs_2 = p_x0 * ((alpha_s - (1 - sigma[:, :, None]) * alpha_t) / (1 - alpha_t))
+      q_xs_2[..., self.mask_index] = (1 - alpha_s - sigma * alpha_t) / (1 - alpha_t)
+      copy_flag = (x != self.mask_index).to(torch.bool)
+      q_xs = torch.where(copy_flag.unsqueeze(-1), q_xs, q_xs_2)
+      xs = _sample_categorical(q_xs)
+
+      if getattr(self.config.sampling, "log_unmask_remask_order", False):
+        if not hasattr(self, "_ddpm_cache_step_idx"):
+            self._ddpm_cache_step_idx = 0
+        self._trace_unmask_remask_update(x, xs)
+        self._ddpm_cache_step_idx += 1
+
+      # === 4) 이번 스텝 '언마스크된' 위치에만 그 시점의 엔트로피를 기록 ===
+      #  - 마스크 확률을 빼고 재정규화해 엔트로피를 계산할지 옵션 제공
+      eps = 1e-12
+      p = p_x0.clamp_min(eps)                    # (B, L, V)
+      if getattr(self.config.sampling, 'entropy_remove_mask_prob', True):
+        p_wo = p.clone()
+        p_wo[..., self.mask_index] = 0
+        Z = p_wo.sum(dim=-1, keepdim=True).clamp_min(eps)
+        q = p_wo / Z
+      else:
+        Z = p.sum(dim=-1, keepdim=True).clamp_min(eps)
+        q = p / Z
+      H = -(q * (q + eps).log()).sum(dim=-1)     # (B, L) — nats
+
+      unmask_mask = (x == self.mask_index) & (xs != self.mask_index)
+      conf[unmask_mask] = H[unmask_mask]         # '언마스크 당시'의 엔트로피를 캐시
+      remask_mask = (x != self.mask_index) & (xs == self.mask_index)
+      conf[remask_mask] = -torch.inf             # 다시 마스크되면 캐시 무효화
+
     elif self.config.sampling.sampler == 'remdm-loop':
       time = t[0].item()
       # compute alpha_t and alpha_s
@@ -824,6 +896,203 @@ class Diffusion(L.LightningModule):
       p_x0_cache = None
 
     return p_x0_cache, xs, conf
+
+  # =======================
+  # PRINT-ONLY STATS HELPERS
+  # =======================
+  def _prob_entropy_stats_from_dist(self, p, x):
+      """
+      p: (B, L, V) 확률분포 (eps로 클램프된 상태 권장)
+      x: (B, L) 현재 토큰 인덱스(마스크/비마스크 위치 구분용)
+      return: dict of scalar tensors (mean 등)
+      """
+      import torch
+      eps = 1e-12
+      p = p.to(torch.float32).clamp_min(eps)
+      V = p.size(-1)
+      m = self.mask_index
+
+      # 기본 확률들
+      p_m = p[..., m]                                 # (B, L)
+      p_wo = p.clone(); p_wo[..., m] = 0              # (B, L, V)
+      p_nonmask_sum  = p_wo.sum(dim=-1)               # (B, L)
+      p_nonmask_mean = p_nonmask_sum / max(1, (V-1))  # (B, L)
+      p_nonmask_max, _ = p_wo.max(dim=-1)             # (B, L)
+
+      # 엔트로피 (full / mask-제외-비정규화 / mask-제외-재정규화)
+      H_full   = -(p * (p + eps).log()).sum(dim=-1)   # (B, L)
+      H_wo_un  = -(p_wo * (p_wo + eps).log()).sum(dim=-1)
+      Z        = p_wo.sum(dim=-1, keepdim=True).clamp_min(eps)
+      q        = p_wo / Z
+      H_wo_re  = -(q * (q + eps).log()).sum(dim=-1)
+
+      # 마스크 항 기여/비중
+      H_m      = -(p_m * (p_m + eps).log())
+      share_m  = H_m / (H_m + H_wo_un + eps)
+
+      # 위치 세그먼트
+      is_mask  = (x == m); is_token = ~is_mask
+      def smean(t, mask=None):
+          if mask is None: return t.mean()
+          if mask.any():   return t[mask].mean()
+          return torch.tensor(float('nan'), device=t.device)
+
+      # 스칼라 요약
+      stats = {
+          "p_mask_mean_all":          p_m.mean(),
+          "p_mask_mean_unmaskedpos":  smean(p_m, is_token),
+          "p_mask_mean_maskedpos":    smean(p_m, is_mask),
+          "p_nonmask_mean_mean":      p_nonmask_mean.mean(),
+          "p_nonmask_max_mean":       p_nonmask_max.mean(),
+          "ratio_mask_over_max":      (p_m / (p_nonmask_max + eps)).mean(),
+          "ratio_mask_over_mean":     (p_m / (p_nonmask_mean + eps)).mean(),
+          "delta_max_minus_mask":     (p_nonmask_max - p_m).mean(),
+          "H_full_mean":              H_full.mean(),
+          "H_wo_un_mean":             H_wo_un.mean(),
+          "H_wo_re_mean":             H_wo_re.mean(),
+          "H_mask_share_mean":        share_m.mean(),
+          "dH_full_minus_wo_re_mean": (H_full - H_wo_re).mean(),
+          "p_mask_p50":               torch.quantile(p_m.flatten(), 0.5),
+          "p_mask_p90":               torch.quantile(p_m.flatten(), 0.9),
+          "p_nonmask_max_p90":        torch.quantile(p_nonmask_max.flatten(), 0.9),
+      }
+      return stats
+
+  def _print_prob_entropy_stats(self, p_x0, x, step, tag="used"):
+      """
+      p_x0: (B,L,V) 현재 샘플러가 실제 사용하는 분포
+      x   : (B,L) 현재 상태
+      step: int (현재 스텝 인덱스)
+      tag : "used" | "wo_maskprob_renorm" 등
+      """
+      import torch
+      eps = 1e-12
+      # 1) 현재 분포 기준
+      stats_used = self._prob_entropy_stats_from_dist(p_x0, x)
+
+      # 2) 마스크 확률 제거 후 재정규화한 분포 기준
+      p_alt = p_x0.clamp_min(eps).clone()
+      p_alt[..., self.mask_index] = 0
+      Z = p_alt.sum(dim=-1, keepdim=True).clamp_min(eps)
+      p_alt = p_alt / Z
+      stats_nom = self._prob_entropy_stats_from_dist(p_alt, x)
+
+      # 3) 콘솔 프린트(콤팩트)
+      def _fmt(k, v): 
+          try: return f"{k}={float(v.detach().cpu().item()):.4f}"
+          except: return f"{k}={v}"
+      used_line = " | ".join([_fmt(k, v) for k, v in [
+          ("p_mask_mean", stats_used["p_mask_mean_all"]),
+          ("p_nonmask_max_mean", stats_used["p_nonmask_max_mean"]),
+          ("ratio_m/max", stats_used["ratio_mask_over_max"]),
+          ("H_full", stats_used["H_full_mean"]),
+          ("H_share_m", stats_used["H_mask_share_mean"]),
+          ("ΔH(full-wo_re)", stats_used["dH_full_minus_wo_re_mean"]),
+      ]])
+      nom_line  = " | ".join([_fmt(k, v) for k, v in [
+          ("p_nonmask_max_mean", stats_nom["p_nonmask_max_mean"]),
+          ("H_full(=H_wo_re)",  stats_nom["H_full_mean"]),
+      ]])
+      print(f"[step {step:4d}] [used] {used_line}")
+      print(f"[step {step:4d}] [wo-mask-prob-renorm] {nom_line}")
+
+  # ==========================
+  # UNMASK/REMASK TRACE HELPERS
+  # ==========================
+  def _trace_unmask_remask_init(self, x_init):
+      import torch
+      B, L = x_init.shape
+      dev = x_init.device
+      self._umr = {
+          "fu": torch.full((B, L), -1, dtype=torch.int32, device=dev),  # first unmask step
+          "fr": torch.full((B, L), -1, dtype=torch.int32, device=dev),  # first remask step (after unmask)
+          "prev_x": x_init.clone(),
+          "step": torch.tensor(0, dtype=torch.int32, device=dev),
+      }
+
+  def _trace_unmask_remask_update(self, x_t, x_s):
+      if not hasattr(self, "_umr"): return
+      m = self.mask_index
+      step = int(self._umr["step"].item())
+      prev = self._umr["prev_x"]
+      fu, fr = self._umr["fu"], self._umr["fr"]
+
+      unmask_evt = (prev == m) & (x_s != m)            # [MASK] -> token
+      remask_evt = (prev != m) & (x_s == m)            # token  -> [MASK]
+      fu[unmask_evt & (fu < 0)] = step                 # 최초 언마스크 시각
+      fr[remask_evt & (fu >= 0) & (fr < 0)] = step     # 언마스크 이후 최초 리마스크 시각
+
+      self._umr["prev_x"] = x_s.clone()
+      self._umr["step"]   = self._umr["step"] + 1
+
+  def _trace_unmask_remask_finish(self, where="sample"):
+      import torch
+      if not hasattr(self, "_umr"): 
+          print("[U/R] nothing traced"); 
+          return
+      fu, fr = self._umr["fu"], self._umr["fr"]
+      valid  = (fu >= 0) & (fr >= 0)
+      any_v  = valid.any()
+
+      # lag 통계
+      lag = torch.where(valid, (fr - fu).float(), torch.nan)
+      lag_mean = torch.nanmean(lag) if any_v else torch.tensor(float("nan"), device=fu.device)
+      lag_p90  = torch.nanquantile(lag, 0.90) if any_v else torch.tensor(float("nan"), device=fu.device)
+
+      # 자카드
+      unmask_set = (fu >= 0); remask_set = (fr >= 0)
+      inter = (unmask_set & remask_set).float().sum()
+      union = (unmask_set | remask_set).float().sum().clamp_min(1.0)
+      jacc  = inter / union
+
+      # 스피어만 순위 상관
+      def _spearman_rank_corr(a, b):
+          eps = torch.finfo(torch.float32).eps
+          n   = a.numel()
+          def _dense_rank(v):
+              noise = torch.arange(n, device=v.device, dtype=v.dtype) * (eps * 10)
+              order = torch.argsort(v + noise)         # 오름차순
+              rank  = torch.empty_like(order, dtype=torch.float32)
+              rank[order] = torch.arange(n, device=v.device, dtype=torch.float32)
+              return rank
+          ra = _dense_rank(a.float()); rb = _dense_rank(b.float())
+          ra = ra - ra.mean(); rb = rb - rb.mean()
+          denom = (ra.std(unbiased=False) * rb.std(unbiased=False)).clamp_min(1e-12)
+          return (ra * rb).mean() / denom
+
+      B, L = fu.shape
+      rhos = []
+      for b in range(B):
+          vb = valid[b]
+          if vb.any():
+              rhos.append(_spearman_rank_corr(fu[b][vb], fr[b][vb]))
+      rho = torch.stack(rhos).mean() if len(rhos) > 0 else torch.tensor(float("nan"), device=fu.device)
+
+      # 콘솔 요약
+      def _f(x): 
+          try: return float(x.detach().cpu().item())
+          except: return x
+      print(f"[U/R-{where}] lag_mean={_f(lag_mean):.3f} | lag_p90={_f(lag_p90):.3f} | jaccard={_f(jacc):.3f} | spearman={_f(rho):.3f}")
+      print(f"[U/R-{where}] cover_unmask={_f(unmask_set.float().mean()):.3f} | cover_remask={_f(remask_set.float().mean()):.3f}")
+
+      # 표본 1개 인덱스의 순서/스텝 열람 (길면 잘림)
+      b0 = int(getattr(self.config.sampling, "log_unmask_remask_example_idx", 0))
+      b0 = max(0, min(b0, B-1))
+      fu_b, fr_b = fu[b0], fr[b0]
+      idx_u = torch.nonzero(fu_b >= 0, as_tuple=False).flatten()
+      idx_r = torch.nonzero(fr_b >= 0, as_tuple=False).flatten()
+      order_u = idx_u[torch.argsort(fu_b[idx_u])]
+      order_r = idx_r[torch.argsort(fr_b[idx_r])]
+      # 너무 길면 앞부분만
+      def _head(lst, k=64): 
+          return lst[:k]
+      print(f"[U/R-{where}] example_b={b0} | unmask_order_idx(head): {_head(order_u.tolist())}")
+      print(f"[U/R-{where}] example_b={b0} | unmask_steps(head):     {_head(fu_b[order_u].tolist())}")
+      print(f"[U/R-{where}] example_b={b0} | remask_order_idx(head): {_head(order_r.tolist())}")
+      print(f"[U/R-{where}] example_b={b0} | remask_steps(head):     {_head(fr_b[order_r].tolist())}")
+
+      del self._umr
+
 
   def _ddpm_update(self, x, t, dt):
     sigma_t, _ = self.noise(t)
@@ -893,6 +1162,19 @@ class Diffusion(L.LightningModule):
     x = self._sample_prior(
       batch_size_per_gpu,
       self.config.model.length).to(self.device)
+    # Ensure trace init if requested or if using mdlm-refine
+    if getattr(self.config.sampling, "log_unmask_remask_order", False):
+      self._trace_unmask_remask_init(x)
+      self._ddpm_cache_step_idx = 0
+    if self.config.sampling.sampler == 'mdlm-refine' and not hasattr(self, "_umr"):
+      # guarantee trace exists for refinement experiments
+      self._trace_unmask_remask_init(x)
+      self._ddpm_cache_step_idx = 0
+    if self.config.sampling.sampler == 'mdlm-refine-2' and not hasattr(self, "_umr"):
+      # guarantee trace exists for refinement experiments
+      self._trace_unmask_remask_init(x)
+      self._ddpm_cache_step_idx = 0
+
     timesteps = torch.linspace(
       1, eps, num_steps + 1, device=self.device)
     dt = (1 - eps) / num_steps
@@ -919,6 +1201,147 @@ class Diffusion(L.LightningModule):
           x = x_next
         else:
           x = self._analytic_update(x, t, dt)
+
+    # ----------------------------
+    # NEW: Post-hoc MDLM unmask-order refinement
+    # ----------------------------
+    # Run BEFORE trace finish (trace contains fu). Controlled by sampler and flag.
+    if self.config.sampling.sampler == 'mdlm-refine' and getattr(self.config.sampling, "do_unmask_refine", True):
+      if not hasattr(self, "_umr"):
+        print("[mdlm-refine] no unmask trace found; skipping refine.")
+      else:
+        fu = self._umr["fu"]        # (B, L) int tensor, -1 means never unmasked
+        B, L = fu.shape
+        device = x.device
+
+        # build per-batch ordered position lists (fu >=0), sorted by fu asc
+        orders = []
+        max_len = 0
+        for b in range(B):
+          fu_b = fu[b]
+          valid_idx = torch.nonzero(fu_b >= 0, as_tuple=False).flatten()
+          if valid_idx.numel() == 0:
+            orders.append(torch.empty(0, dtype=torch.long, device=device))
+            continue
+          vals = fu_b[valid_idx].to(torch.int64)
+          perm = torch.argsort(vals, dim=0)
+          ordered_pos = valid_idx[perm]
+          orders.append(ordered_pos)
+          if ordered_pos.numel() > max_len:
+            max_len = ordered_pos.numel()
+
+        print(f"[mdlm-refine] Starting post-hoc refinement; batches={B}, max_positions={max_len}")
+
+        # zeros sigma for deterministic conditioning (shape (B,))
+        zeros_sigma = torch.zeros((x.shape[0],), device=device, dtype=self.dtype)
+        with torch.no_grad():
+          for rank in range(max_len):
+            # build mask of positions to refine this round
+            batch_mask = torch.zeros((B, L), dtype=torch.bool, device=device)
+            any_pos = False
+            for b in range(B):
+              if rank < orders[b].numel():
+                pos = int(orders[b][rank].item())
+                batch_mask[b, pos] = True
+                any_pos = True
+            if not any_pos:
+              continue
+
+            # remask those positions
+            x[batch_mask] = self.mask_index
+
+            # forward once for whole batch
+            logits = self.forward(x, zeros_sigma[:, None])  # (B, L, V) logits or log-probs
+            p = logits.exp()
+
+            # apply nucleus (vectorized) if configured
+            if self.config.sampling.nucleus_p < 1:
+              sorted_probs, sorted_idx = torch.sort(p, descending=True, dim=-1)
+              cumprobs = torch.cumsum(sorted_probs, dim=-1)
+              keep_mask = cumprobs <= float(self.config.sampling.nucleus_p)
+              keep_mask[..., 0] = True  # always keep top token to avoid empty
+              nucleus = sorted_probs * keep_mask
+              nucleus = nucleus / nucleus.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+              p = torch.zeros_like(p).scatter_(-1, sorted_idx, nucleus)
+
+            # sample across entire (B,L) then pick masked positions
+            sampled = _sample_categorical(p)  # (B, L)
+
+            # replace only remasked positions
+            x[batch_mask] = sampled[batch_mask]
+
+            if getattr(self.config.sampling, "print_refine_progress", False):
+              print(f"[mdlm-refine] refine-rank {rank:4d} remasked_count={batch_mask.sum().item()}")
+
+        print("[mdlm-refine] Refinement finished.")
+    
+    # ----------------------------
+    # NEW: mdlm-refine-2
+    #  - group by same 'fu' (first-unmask step) value across the batch
+    #  - remask all positions that have identical fu and refine them in one forward
+    # ----------------------------
+    if self.config.sampling.sampler == 'mdlm-refine-2' and getattr(self.config.sampling, "do_unmask_refine", True):
+      if not hasattr(self, "_umr"):
+        print("[mdlm-refine-2] no unmask trace found; skipping refine.")
+      else:
+        fu = self._umr["fu"]        # (B, L) int tensor, -1 means never unmasked
+        B, L = fu.shape
+        device = x.device
+
+        # collect all unique fu values across batch (excluding -1) and sort ascending
+        mask_valid = (fu >= 0)
+        if not mask_valid.any():
+          print("[mdlm-refine-2] no positions were ever unmasked; skipping.")
+        else:
+          vals = fu[mask_valid].unique()
+          vals, _ = torch.sort(vals)   # sorted 1D tensor of unique fu values
+
+          print(f"[mdlm-refine-2] Starting post-hoc refinement; batches={B}, unique_fu_count={vals.numel()}")
+
+          zeros_sigma = torch.zeros((x.shape[0],), device=device, dtype=self.dtype)
+          with torch.no_grad():
+            for fu_val in vals:
+              # boolean mask of positions to refine: True where fu == fu_val
+              batch_mask = (fu == fu_val)
+              remasked_count = int(batch_mask.sum().item())
+              if remasked_count == 0:
+                continue
+
+              # remask them
+              x[batch_mask] = self.mask_index
+
+              # forward once for whole batch (sigma=0 conditioning)
+              logits = self.forward(x, zeros_sigma[:, None])  # (B, L, V) logits
+              p = logits.exp()
+
+              # optional nucleus filtering (vectorized)
+              if self.config.sampling.nucleus_p < 1:
+                sorted_probs, sorted_idx = torch.sort(p, descending=True, dim=-1)
+                cumprobs = torch.cumsum(sorted_probs, dim=-1)
+                keep_mask = cumprobs <= float(self.config.sampling.nucleus_p)
+                keep_mask[..., 0] = True
+                nucleus = sorted_probs * keep_mask
+                nucleus = nucleus / nucleus.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+                p = torch.zeros_like(p).scatter_(-1, sorted_idx, nucleus)
+
+              # safe clamp
+              p = p.clamp_min(1e-12)
+
+              # sample and replace only the remasked positions
+              sampled = _sample_categorical(p)  # (B, L)
+              x[batch_mask] = sampled[batch_mask]
+
+              # print small progress line if requested
+              if getattr(self.config.sampling, "print_refine_progress", False):
+                print(f"[mdlm-refine-2] fu={int(fu_val.item()):4d} remasked_count={remasked_count}")
+
+          print("[mdlm-refine-2] Refinement finished.")
+
+
+    if getattr(self.config.sampling, "log_unmask_remask_order", False):
+      self._trace_unmask_remask_finish(where="sample")
+      if hasattr(self, "_ddpm_cache_step_idx"):
+        del self._ddpm_cache_step_idx
 
     if self.config.sampling.noise_removal:
       t = min_t * torch.ones(x.shape[0], 1,

@@ -16,7 +16,7 @@ checkpoint_path=/home/junsu0115/remdm/outputs/checkpoints/mdlm.ckpt
 T=0
 sampling_steps=1024
 p=0.9
-generated_seqs_path=/home/junsu0115/remdm/outputs/remdm-ent_T-${sampling_steps}_topp-${p}.json
+generated_seqs_path=/home/junsu0115/remdm/outputs/remdm-ent-2_T-${sampling_steps}_topp-${p}.json
 
 export HYDRA_FULL_ERROR=1
 
@@ -34,12 +34,16 @@ python -u -m main \
     eval.checkpoint_path=${checkpoint_path} \
     time_conditioning=false \
     +wandb.offline=true \
-    hydra.run.dir="${PWD}/outputs/remdm-ent" \
+    hydra.run.dir="${PWD}/outputs/remdm-ent-2" \
     T=${T} \
     sampling.steps=${sampling_steps} \
     seed=1 \
-    sampling.num_sample_batches=10 \
+    sampling.num_sample_batches=1 \
     sampling.generated_seqs_path=${generated_seqs_path} \
     sampling.nucleus_p=${p} \
-    sampling.sampler="remdm-ent"
-    +sampling.entropy_remove_mask_prob=true
+    sampling.sampler="remdm-ent-2" \
+    +sampling.entropy_remove_mask_prob=true \
+    +sampling.print_prob_entropy_stats=true \
+    +sampling.print_every=100 \
+    +sampling.log_unmask_remask_order=true \
+    +sampling.log_unmask_remask_example_idx=0
