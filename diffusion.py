@@ -890,6 +890,218 @@ class Diffusion(L.LightningModule):
         q_xs = torch.where(copy_flag.unsqueeze(-1), q_xs, q_xs_2)
         xs = _sample_categorical(q_xs)
 
+    elif self.config.sampling.sampler == 'refine-ent-2':
+      eps = 1e-12
+      if not hasattr(self, "_ddpm_cache_step_idx"):
+          self._ddpm_cache_step_idx = 0
+
+      refine_every = int(getattr(self.config.sampling, "refine_every", 1))
+      do_refine = (self._ddpm_cache_step_idx % max(1, refine_every)) == 0
+
+      alpha_t = (1 - move_chance_t)[0].item()
+      alpha_s = (1 - move_chance_s)[0].item()
+      denom = max(eps, (1.0 - alpha_t))
+      # sigma_max = min(1, (1 - alpha_s)/alpha_t)  (수치안전)
+      sigma_max = min(1.0, (1.0 - alpha_s) / max(eps, alpha_t))
+
+      # 1st forward에서 얻은 p_x0는 상단 공통 경로에서 준비되어 있다고 가정
+      masked_flag = (x == self.mask_index)
+
+      # [MASK]였던 위치: MDLM posterior(q_xs_2)로 언마스크 (기본 전이 유지)
+      xs = x.clone()
+      if masked_flag.any():
+          # q_xs_2(token) = p_x0(token) * ((alpha_s - alpha_t)/(1 - alpha_t))
+          # q_xs_2([MASK]) = (1 - alpha_s)/(1 - alpha_t)
+          q_xs_2 = p_x0 * ((alpha_s - alpha_t) / denom)
+          q_xs_2[..., self.mask_index] = (1.0 - alpha_s) / denom
+          q_xs_2 = q_xs_2.clamp_min(eps)
+          q_xs_2 = q_xs_2 / q_xs_2.sum(dim=-1, keepdim=True).clamp_min(eps)
+
+          _x_mask = _sample_categorical(q_xs_2)
+          xs[masked_flag] = _x_mask[masked_flag]
+
+      # 주기적으로만 in-step refine 수행
+      if do_refine:
+          # remdm-ent-2와 동일한 위치 선택: eta = softmax(conf); [MASK]는 후보 제외
+          eta = conf.softmax(dim=-1)
+          eta = eta.masked_fill(masked_flag, 0.0)
+
+          # per-token sigma = eta * sigma_max (0<=sigma<=sigma_max)
+          sigma = (eta * sigma_max).clamp_(0.0, 1.0)
+
+          # Bernoulli(sigma)로 R 샘플 (언마스크인 위치에서만)
+          unmasked_flag = ~masked_flag
+          bern = torch.rand_like(sigma)
+          R = (bern < sigma) & unmasked_flag  # 리마스크 대상
+
+          # R이 하나도 없으면 2nd forward 생략 가능(하지만 단순성을 위해 빈 집합 허용)
+          if R.any():
+              # in-step 2-forward: R만 remask한 컨텍스트로 다시 forward
+              x_tmp = xs.clone()
+              x_tmp[R] = self.mask_index
+
+              log_p_x0_2 = self.forward(x_tmp, sigma_t)
+
+              # nucleus(top-p) 재적용
+              if self.config.sampling.nucleus_p < 1.0:
+                  p2 = log_p_x0_2.exp()
+                  sorted_probs, sorted_indices = torch.sort(p2, descending=True, dim=-1)
+                  cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                  top_p_mask = (cumulative_probs <= self.config.sampling.nucleus_p)
+                  top_p_mask[..., 0] = True
+                  nucleus_probs = sorted_probs * top_p_mask
+                  nucleus_probs = nucleus_probs / nucleus_probs.sum(dim=-1, keepdim=True).clamp_min(eps)
+                  p_x0_2 = torch.zeros_like(p2).scatter_(-1, sorted_indices, nucleus_probs)
+              else:
+                  p_x0_2 = log_p_x0_2.exp()
+
+              # R 위치만 p'_x0에서 재샘플 → 즉시 언마스크(=refine)
+              _refine = _sample_categorical(p_x0_2)
+              xs[R] = _refine[R]
+
+      # ---- (선택) 통계/트레이스 로깅 ----
+      if getattr(self.config.sampling, "print_prob_entropy_stats", False):
+          pe_every = int(getattr(self.config.sampling, "print_every", 1))
+          if (self._ddpm_cache_step_idx % max(1, pe_every)) == 0:
+              self._print_prob_entropy_stats(p_x0, x, step=int(self._ddpm_cache_step_idx))
+
+      if getattr(self.config.sampling, "log_unmask_remask_order", False):
+          self._trace_unmask_remask_update(x, xs)
+
+      # ---- conf 캐시 업데이트: 이번 step에서 [MASK]->토큰 된 위치만 ----
+      p = p_x0.clamp_min(eps)
+      if getattr(self.config.sampling, 'entropy_remove_mask_prob', True):
+          p_wo = p.clone()
+          p_wo[..., self.mask_index] = 0
+          Z = p_wo.sum(dim=-1, keepdim=True).clamp_min(eps)
+          q = p_wo / Z
+      else:
+          Z = p.sum(dim=-1, keepdim=True).clamp_min(eps)
+          q = p / Z
+      H = -(q * (q + eps).log()).sum(dim=-1)
+
+      unmask_mask = (x == self.mask_index) & (xs != self.mask_index)
+      conf[unmask_mask] = H[unmask_mask]
+
+      # step index 증가
+      self._ddpm_cache_step_idx += 1
+
+      # 캐시 반환 규칙(기존과 동일)
+      if torch.allclose(xs, x) and not self.time_conditioning:
+          p_x0_cache = p_x0
+      else:
+          p_x0_cache = None
+
+      return p_x0_cache, xs, conf
+
+    elif self.config.sampling.sampler == 'refine-ent-3':
+        eps = 1e-12
+        if not hasattr(self, "_ddpm_cache_step_idx"):
+            self._ddpm_cache_step_idx = 0
+
+        # 주기적 실행: k=1이면 매 스텝 실행
+        refine_every = int(getattr(self.config.sampling, "refine_every", 1))
+        do_refine = (self._ddpm_cache_step_idx % max(1, refine_every)) == 0
+
+        # 스케줄 파라미터 (move_chance_t/s는 상위 공통 경로에서 계산되어 전달된다고 가정)
+        alpha_t = (1 - move_chance_t)[0].item()
+        alpha_s = (1 - move_chance_s)[0].item()
+        sigma_max = min(1.0, (1.0 - alpha_s) / max(eps, alpha_t))
+        denom = max(eps, 1.0 - alpha_t)
+
+        # 1st forward의 p_x0는 상단 공통 경로에서 준비되어 있다고 가정 (top-p 적용 포함)
+        masked_flag = (x == self.mask_index)
+        xs = x.clone()
+
+        # (A) [MASK]였던 위치: MDLM posterior(q_xs_2)로 언마스크 (기본 전이 유지)
+        if masked_flag.any():
+            # q_xs_2(token) = p_x0(token) * ((alpha_s - alpha_t)/(1 - alpha_t))
+            # q_xs_2([MASK]) = (1 - alpha_s)/(1 - alpha_t)
+            q_xs_2 = p_x0 * ((alpha_s - alpha_t) / denom)
+            q_xs_2[..., self.mask_index] = (1.0 - alpha_s) / denom
+            q_xs_2 = q_xs_2.clamp_min(eps)
+            q_xs_2 = q_xs_2 / q_xs_2.sum(dim=-1, keepdim=True).clamp_min(eps)
+            _x_mask = _sample_categorical(q_xs_2)
+            xs[masked_flag] = _x_mask[masked_flag]
+
+        # (B) in-step 2-forward refine: remdm-ent-2와 동일한 방식으로 R 선택하되, refine 시 엔트로피를 덮어씀
+        if do_refine:
+            # 위치별 가중치: eta = softmax(conf); 현재 [MASK]는 후보 제외
+            eta = conf.softmax(dim=-1)
+            eta = eta.masked_fill(masked_flag, 0.0)
+
+            # per-token sigma = eta * sigma_max (0<=sigma<=sigma_max)
+            sigma = (eta * sigma_max).clamp_(0.0, 1.0)
+
+            # Bernoulli(sigma)로 R 샘플 (언마스크 위치만)
+            unmasked_flag = ~masked_flag
+            R = (torch.rand_like(sigma) < sigma) & unmasked_flag
+
+            if R.any():
+                # R을 remask한 컨텍스트로 2nd forward 수행
+                x_tmp = xs.clone()
+                x_tmp[R] = self.mask_index
+
+                log_p_x0_2 = self.forward(x_tmp, sigma_t)
+
+                # nucleus(top-p) 재적용
+                if self.config.sampling.nucleus_p < 1.0:
+                    p2 = log_p_x0_2.exp()
+                    sorted_probs, sorted_indices = torch.sort(p2, descending=True, dim=-1)
+                    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                    top_p_mask = (cumulative_probs <= self.config.sampling.nucleus_p)
+                    top_p_mask[..., 0] = True
+                    nucleus_probs = sorted_probs * top_p_mask
+                    nucleus_probs = nucleus_probs / nucleus_probs.sum(dim=-1, keepdim=True).clamp_min(eps)
+                    p_x0_2 = torch.zeros_like(p2).scatter_(-1, sorted_indices, nucleus_probs)
+                else:
+                    p_x0_2 = log_p_x0_2.exp()
+
+                # R 위치만 p'_x0에서 재샘플 → 즉시 언마스크(=refine)
+                _refine = _sample_categorical(p_x0_2)
+                xs[R] = _refine[R]
+
+                # (핵심) refine 직후 분포로 conf 덮어쓰기 (EMA/쿨다운 없이 순수 overwrite)
+                # 마스크 확률 제거 옵션 동일하게 적용
+                P2 = p_x0_2.clamp_min(eps)
+                if getattr(self.config.sampling, 'entropy_remove_mask_prob', True):
+                    Pw = P2.clone(); Pw[..., self.mask_index] = 0.0
+                    Z = Pw.sum(dim=-1, keepdim=True).clamp_min(eps)
+                    Q = Pw / Z
+                else:
+                    Z = P2.sum(dim=-1, keepdim=True).clamp_min(eps)
+                    Q = P2 / Z
+                H2 = -(Q * (Q + eps).log()).sum(dim=-1)  # (B, L)
+                conf[R] = H2[R]  # 덮어쓰기
+
+        # (C) 이번 step에서 [MASK]->토큰이 된 자리(conf 업데이트: 1st forward 기준)
+        #  * refine으로 바뀐 자리(R)는 위에서 이미 H2로 갱신했으니 여기서는 제외되어도 무방
+        P1 = p_x0.clamp_min(eps)
+        if getattr(self.config.sampling, 'entropy_remove_mask_prob', True):
+            Pw1 = P1.clone(); Pw1[..., self.mask_index] = 0.0
+            Z1 = Pw1.sum(dim=-1, keepdim=True).clamp_min(eps)
+            Q1 = Pw1 / Z1
+        else:
+            Z1 = P1.sum(dim=-1, keepdim=True).clamp_min(eps)
+            Q1 = P1 / Z1
+        H1 = -(Q1 * (Q1 + eps).log()).sum(dim=-1)
+        unmask_mask = (x == self.mask_index) & (xs != self.mask_index)
+        conf[unmask_mask] = H1[unmask_mask]
+
+        # step++
+        self._ddpm_cache_step_idx += 1
+
+        # 캐시 반환 규칙
+        if torch.allclose(xs, x) and not self.time_conditioning:
+            p_x0_cache = p_x0
+        else:
+            p_x0_cache = None
+
+        return p_x0_cache, xs, conf
+
+
+
+
     if torch.allclose(xs, x) and not self.time_conditioning:
       p_x0_cache = p_x0
     else:

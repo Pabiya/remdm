@@ -14,7 +14,7 @@
 
 checkpoint_path=/home/junsu0115/remdm/outputs/checkpoints/mdlm.ckpt
 T=0
-sampling_steps=1024
+sampling_steps=4096
 p=0.9
 eta=0.02
 t_on=0.55
@@ -41,7 +41,7 @@ python -u -m main \
     T=${T} \
     sampling.steps=${sampling_steps} \
     seed=1 \
-    sampling.num_sample_batches=300 \
+    sampling.num_sample_batches=10 \
     sampling.generated_seqs_path=${generated_seqs_path} \
     sampling.nucleus_p=${p} \
     sampling.sampler="remdm-loop" \
