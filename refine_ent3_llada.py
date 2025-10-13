@@ -80,7 +80,8 @@ def sample_categorical(probs: torch.Tensor, generator: Optional[torch.Generator]
 
 def entropy_from_probs(probs: torch.Tensor, mask_index: int, remove_mask_prob: bool = True, eps: float = 1e-12) -> torch.Tensor:
     """Compute token-level Shannon entropy H over vocab (optionally excluding [MASK])."""
-    P = probs.clamp_min(eps)
+    # ★ BF16 → FP32 로 올려서 안정/정합 확보
+    P = probs.float().clamp_min(eps)
     if remove_mask_prob:
         Pw = P.clone()
         Pw[..., mask_index] = 0.0
@@ -90,7 +91,8 @@ def entropy_from_probs(probs: torch.Tensor, mask_index: int, remove_mask_prob: b
         Z = P.sum(dim=-1, keepdim=True).clamp_min(eps)
         Q = P / Z
     H = -(Q * (Q + eps).log()).sum(dim=-1)  # (...,)
-    return H
+    return H  # float32 유지
+
 
 
 def build_q_xs2_from_p_x0(p_x0: torch.Tensor, alpha_t: float, alpha_s: float, mask_index: int, eps: float = 1e-12) -> torch.Tensor:
@@ -184,7 +186,7 @@ class RefineEnt3Sampler:
         prompts_ids = self.tok(prompts, add_special_tokens=False)["input_ids"]
         x, prompt_mask = left_pad_and_mask(prompts_ids, max_len=max_len, mask_id=self.mask_id, device=device)
         B, L = x.shape
-        self.conf = torch.zeros((B, L), device=device)
+        self.conf = torch.zeros((B, L), device=device, dtype=torch.float32)
         self.step_idx = 0
 
         # main diffusion loop
@@ -226,12 +228,12 @@ class RefineEnt3Sampler:
                     x[R] = refill_tok[R]
                     # overwrite conf at R with entropy from 2nd forward
                     H2 = entropy_from_probs(p_x0_2, mask_index=self.mask_id, remove_mask_prob=self.remove_mask_prob)
-                    self.conf[R] = H2[R]
+                    self.conf[R] = H2[R].to(self.conf.dtype)
 
             # 3) conf update for newly unmasked ([MASK]->token) positions from first forward
             H1 = entropy_from_probs(p_x0, mask_index=self.mask_id, remove_mask_prob=self.remove_mask_prob)
             became_unmasked = (prev_mask & (x != self.mask_id))
-            self.conf[became_unmasked] = H1[became_unmasked]
+            self.conf[became_unmasked] = H1[became_unmasked].to(self.conf.dtype)
 
             self.step_idx += 1
 
