@@ -51,8 +51,7 @@ def _first_present(ex: dict, keys: List[str], default: str = "") -> str:
     return default
 
 
-def load_mbpp_prompts() -> Tuple[List[str], List[int]]:
-    # Prefer sanitized split; fallbacks supported
+def load_mbpp_prompts() -> Tuple[List[str], List[str]]:
     ds_dict = datasets.load_dataset("google-research-datasets/mbpp", "sanitized")
     split = "test" if "test" in ds_dict else ("validation" if "validation" in ds_dict else "train")
     ds = ds_dict[split]
@@ -63,7 +62,8 @@ def load_mbpp_prompts() -> Tuple[List[str], List[int]]:
         starter = _first_present(ex, ["code", "starter_code", "starter"], "")
         p = prompt_txt + ("\n" + starter if starter else "")
         prompts.append(p)
-        ids.append(ex.get("task_id", ex.get("id", len(ids))))
+        raw_id = ex.get("task_id", ex.get("id", len(ids)))
+        ids.append(f"MBPP/{raw_id}")
     return prompts, ids
 
 
@@ -133,7 +133,8 @@ def generate_with_refine3(
                 batch_prompts = prompts[i:i+batch_size]
                 batch_comps = sampler.sample(prompts=batch_prompts, max_len=max_len, steps=steps, seed=seed+i)
                 for key, code in zip(ids[i:i+batch_size], batch_comps):
-                    f.write(json.dumps({"task_id": key, "completion": code}, ensure_ascii=False) + "\n")
+                    key_str = key if isinstance(key, str) else f"MBPP/{key}"
+                    f.write(json.dumps({"task_id": key_str, "completion": code}, ensure_ascii=False) + "\n")
         cmd = ["evalplus.evaluate", "--dataset", "mbpp", "--samples", out_path]
         print("Running:", " ".join(cmd), flush=True)
         subprocess.run(cmd, check=True)
