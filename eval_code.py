@@ -7,14 +7,6 @@ Evaluate saved generations on HumanEval / MBPP without re-generating.
 - Outputs:
     * HumanEval: pass@k to stdout, optional JSON summary (--report_out)
     * MBPP: pass@1 to stdout, optional JSON summary (--report_out) and per-task detail (--detail_out)
-
-Notes:
-- HumanEval problem file is resolved robustly:
-  1) try package path via importlib.resources
-  2) else synthesize a temp JSONL from human_eval.data.read_problems()
-- Optional completion post-process:
-  --apply_filter_code  : keep only the first function chunk (repo style)
-  --fix_indents        : replace tabs with 4 spaces
 """
 
 from __future__ import annotations
@@ -24,17 +16,13 @@ from tqdm import tqdm
 from datasets import load_dataset
 
 # ------------------------------
-# Small utils (inspired by reference repo)
+# Small utils (optional post-process)
 # ------------------------------
 def filter_code(completion: str) -> str:
-    """Keep only the first function block; strip leading newlines."""
-    # ref: evaluation.py in the reference repo
     completion = completion.lstrip("\n")
     return completion.split("\n\n")[0]
 
 def fix_indents(text: str) -> str:
-    """Normalize tabs -> 4 spaces."""
-    # ref: evaluation.py in the reference repo
     return text.replace("\t", "    ")
 
 def load_jsonl(path: str):
@@ -46,23 +34,37 @@ def load_jsonl(path: str):
                 rows.append(json.loads(s))
     return rows
 
+
 # ------------------------------
 # HumanEval helpers
 # ------------------------------
-def _synthesize_humaneval_problem_file_from_read_problems() -> str:
+def _materialize_humaneval_problem_file_subset(task_ids: set[str]) -> str:
     """
-    Build a temp HumanEval problems JSONL from human_eval.data.read_problems(),
-    matching the harness schema (task_id, prompt, canonical_solution, test, entry_point).
+    HumanEval 문제를 human_eval.data.read_problems()에서 읽어
+    '샘플에 존재하는 task_id'만 포함한 임시 JSONL을 만들어 경로를 반환.
     """
     try:
-        from human_eval.data import read_problems  # preferred: packaged problems
+        from human_eval.data import read_problems
         problems = read_problems()
     except Exception as e:
-        raise RuntimeError(f"Failed to read HumanEval problems via human_eval.data.read_problems(): {e}")
+        # 패키지가 없다면 HF datasets에서 가져와서 필터
+        ds = load_dataset("openai_humaneval", split="test")
+        problems = {
+            ex["task_id"]: {
+                "prompt": ex["prompt"],
+                "canonical_solution": ex.get("canonical_solution", ""),
+                "test": ex["test"],
+                "entry_point": ex.get("entry_point", ""),
+            }
+            for ex in ds
+        }
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl")
     with open(tmp.name, "w", encoding="utf-8") as f:
-        for tid, ex in problems.items():
+        for tid in sorted(task_ids):
+            ex = problems.get(tid)
+            if not ex:  # 샘플에만 있고 문제사전에 없으면 건너뜀
+                continue
             obj = {
                 "task_id": tid,
                 "prompt": ex.get("prompt", ""),
@@ -72,28 +74,6 @@ def _synthesize_humaneval_problem_file_from_read_problems() -> str:
             }
             f.write(json.dumps(obj) + "\n")
     return tmp.name
-
-def _resolve_humaneval_problem_file(explicit_path: str | None = None) -> str:
-    """
-    Resolve HumanEval problem file robustly:
-      1) explicit_path if exists
-      2) package resource: human_eval/data/HumanEval.jsonl
-      3) synthesize from read_problems()
-    """
-    if explicit_path and os.path.exists(explicit_path):
-        return explicit_path
-
-    # try importlib.resources path inside installed package
-    try:
-        import importlib.resources as ir
-        with ir.as_file(ir.files("human_eval").joinpath("data/HumanEval.jsonl")) as p:
-            if p.exists():
-                return str(p)
-    except Exception:
-        pass
-
-    # fallback: synthesize via read_problems()
-    return _synthesize_humaneval_problem_file_from_read_problems()
 
 def _print_and_maybe_save_he_summary(summary: dict, report_out: str | None):
     pa1 = summary.get("pass@1"); pa10 = summary.get("pass@10"); pa100 = summary.get("pass@100")
@@ -105,7 +85,6 @@ def _print_and_maybe_save_he_summary(summary: dict, report_out: str | None):
         print(f"[HumanEval] report saved -> {report_out}")
 
 def _eval_humaneval_via_subprocess(samples_path: str, problem_file: str, workers: int, report_out: str | None):
-    """Backup path: call harness via subprocess and robustly parse JSON from stdout."""
     cmd = [
         sys.executable, "-m", "human_eval.evaluation",
         "--samples", samples_path,
@@ -139,20 +118,21 @@ def _eval_humaneval_via_subprocess(samples_path: str, problem_file: str, workers
     _print_and_maybe_save_he_summary(summary, report_out)
     return True
 
+
 # ------------------------------
 # HumanEval evaluation
 # ------------------------------
 def eval_humaneval(jsonl_path: str, limit=0, workers=8, report_out: str | None = None,
                    apply_filter_code=False, apply_fix_indents=False):
     """
-    Prefer the human_eval Python API; fallback to subprocess.
-    Optionally post-process completions (filter/indent) before writing samples.
+    HumanEval은 샘플에 포함된 task_id만 담은 문제파일 서브셋을 만들어 평가한다.
+    Python API 우선, 실패 시 subprocess 백업.
     """
     rows = load_jsonl(jsonl_path)
     if limit and limit > 0:
         rows = rows[:limit]
 
-    # optional completion post-process (inspired by reference repo)
+    # optional completion post-process
     if apply_filter_code or apply_fix_indents:
         for r in rows:
             c = r.get("completion", "")
@@ -162,22 +142,23 @@ def eval_humaneval(jsonl_path: str, limit=0, workers=8, report_out: str | None =
                 c = filter_code(c)
             r["completion"] = c
 
-    # write samples for harness/API
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl")
+    # 샘플 JSONL (task_id, completion)
+    tmp_samples = tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl")
     for r in tqdm(rows, desc="prepare-humaneval", total=len(rows), dynamic_ncols=True):
         obj = {"task_id": r["task_id"], "completion": r["completion"]}
-        tmp.write((json.dumps(obj) + "\n").encode("utf-8"))
-    tmp.close()
+        tmp_samples.write((json.dumps(obj) + "\n").encode("utf-8"))
+    tmp_samples.close()
 
-    # robust problem-file resolution
-    problem_file = _resolve_humaneval_problem_file("human_eval/data/HumanEval.jsonl")
+    # 문제파일: 샘플에 포함된 task_id 서브셋으로 한정
+    task_ids = {r["task_id"] for r in rows}
+    problem_file = _materialize_humaneval_problem_file_subset(task_ids)
 
-    # Python API first
+    # Python API 먼저
     try:
         from human_eval.evaluation import evaluate_functional_correctness
-        print(f"[eval] Running HumanEval (python API): samples={tmp.name}, problem_file={problem_file}, n_workers={workers}")
+        print(f"[eval] Running HumanEval (python API): samples={tmp_samples.name}, problem_file={problem_file}, n_workers={workers}")
         summary = evaluate_functional_correctness(
-            sample_file=tmp.name,
+            sample_file=tmp_samples.name,
             problem_file=problem_file,
             k=[1, 10, 100],
             n_workers=workers,
@@ -187,8 +168,9 @@ def eval_humaneval(jsonl_path: str, limit=0, workers=8, report_out: str | None =
     except Exception as e:
         print("[eval] human_eval API failed, falling back to subprocess:", e)
 
-    # fallback
-    return _eval_humaneval_via_subprocess(tmp.name, problem_file, workers, report_out)
+    # 백업: subprocess
+    return _eval_humaneval_via_subprocess(tmp_samples.name, problem_file, workers, report_out)
+
 
 # ------------------------------
 # MBPP evaluation (unit-test runner)
@@ -197,7 +179,6 @@ def eval_mbpp(jsonl_path: str, sanitized=True, limit=0, timeout=10,
               report_out: str | None = None, detail_out: str | None = None,
               apply_filter_code=False, apply_fix_indents=False):
     rows = load_jsonl(jsonl_path)
-    # Optional completion post-process (same knobs for consistency)
     if apply_filter_code or apply_fix_indents:
         for r in rows:
             c = r.get("completion", "")
@@ -283,6 +264,7 @@ def eval_mbpp(jsonl_path: str, sanitized=True, limit=0, timeout=10,
 
     return True
 
+
 # ------------------------------
 # CLI
 # ------------------------------
@@ -300,7 +282,7 @@ def main():
     ap.add_argument("--timeout", type=int, default=10, help="MBPP per-task timeout (seconds)")
     ap.add_argument("--detail_out", type=str, default="", help="save per-task MBPP results (JSONL)")
 
-    # Optional completion post-process (reference repo style)
+    # Optional completion post-process
     ap.add_argument("--apply_filter_code", action="store_true", help="strip to the first function block before eval")
     ap.add_argument("--fix_indents", action="store_true", help="replace tabs with 4 spaces before eval")
 
