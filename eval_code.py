@@ -2,68 +2,110 @@
 # -*- coding: utf-8 -*-
 """
 Evaluate saved generations on HumanEval / MBPP without re-generating.
-- Input: JSONL from gen_code.py (or compatible)
-- Output:
-    * HumanEval: pass@k (stdout), optional JSON summary (--report_out)
-    * MBPP: pass@1 (stdout), optional JSON summary (--report_out) and per-task detail (--detail_out)
+- Input JSONL format (per line):
+    {"task_id": "...", "completion": "..."}     # prompt field is ignored for eval
+- Outputs:
+    * HumanEval: pass@k to stdout, optional JSON summary (--report_out)
+    * MBPP: pass@1 to stdout, optional JSON summary (--report_out) and per-task detail (--detail_out)
+
+Notes:
+- HumanEval problem file is resolved robustly:
+  1) try package path via importlib.resources
+  2) else synthesize a temp JSONL from human_eval.data.read_problems()
+- Optional completion post-process:
+  --apply_filter_code  : keep only the first function chunk (repo style)
+  --fix_indents        : replace tabs with 4 spaces
 """
 
+from __future__ import annotations
 import argparse, json, sys, subprocess, tempfile, textwrap, os
 from pathlib import Path
 from tqdm import tqdm
 from datasets import load_dataset
 
+# ------------------------------
+# Small utils (inspired by reference repo)
+# ------------------------------
+def filter_code(completion: str) -> str:
+    """Keep only the first function block; strip leading newlines."""
+    # ref: evaluation.py in the reference repo
+    completion = completion.lstrip("\n")
+    return completion.split("\n\n")[0]
 
-def load_jsonl(path):
+def fix_indents(text: str) -> str:
+    """Normalize tabs -> 4 spaces."""
+    # ref: evaluation.py in the reference repo
+    return text.replace("\t", "    ")
+
+def load_jsonl(path: str):
     rows = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
-            if line.strip():
-                rows.append(json.loads(line))
+            s = line.strip()
+            if s:
+                rows.append(json.loads(s))
     return rows
 
-
 # ------------------------------
-# HumanEval evaluation
+# HumanEval helpers
 # ------------------------------
-def eval_humaneval(jsonl_path, limit=0, workers=8, report_out=None):
+def _synthesize_humaneval_problem_file_from_read_problems() -> str:
     """
-    Prefer the human_eval Python API for stable JSON results.
-    Fallback to subprocess only if the module is not importable.
+    Build a temp HumanEval problems JSONL from human_eval.data.read_problems(),
+    matching the harness schema (task_id, prompt, canonical_solution, test, entry_point).
     """
-    rows = load_jsonl(jsonl_path)
-    if limit and limit > 0:
-        rows = rows[:limit]
-
-    # Prepare samples file for the harness/API: [{"task_id","completion"}, ...]
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl")
-    for r in tqdm(rows, desc="prepare-humaneval", total=len(rows), dynamic_ncols=True):
-        obj = {"task_id": r["task_id"], "completion": r["completion"]}
-        tmp.write((json.dumps(obj) + "\n").encode("utf-8"))
-    tmp.close()
-
-    problem_file = "human_eval/data/HumanEval.jsonl"
-
-    # Try Python API
     try:
-        from human_eval.evaluation import evaluate_functional_correctness
-        print(f"[eval] Running HumanEval (python API): samples={tmp.name}, problem_file={problem_file}, n_workers={workers}")
-        summary = evaluate_functional_correctness(
-            sample_file=tmp.name,
-            problem_file=problem_file,
-            k=[1, 10, 100],
-            n_workers=workers,
-        )
-        _print_and_maybe_save_he_summary(summary, report_out)
-        return True
+        from human_eval.data import read_problems  # preferred: packaged problems
+        problems = read_problems()
     except Exception as e:
-        print("[eval] human_eval import failed, falling back to subprocess:", e)
+        raise RuntimeError(f"Failed to read HumanEval problems via human_eval.data.read_problems(): {e}")
 
-    # Fallback: subprocess (robust JSON extraction)
-    return _eval_humaneval_via_subprocess(tmp.name, problem_file, workers, report_out)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl")
+    with open(tmp.name, "w", encoding="utf-8") as f:
+        for tid, ex in problems.items():
+            obj = {
+                "task_id": tid,
+                "prompt": ex.get("prompt", ""),
+                "canonical_solution": ex.get("canonical_solution", ""),
+                "test": ex.get("test", ""),
+                "entry_point": ex.get("entry_point", ""),
+            }
+            f.write(json.dumps(obj) + "\n")
+    return tmp.name
 
+def _resolve_humaneval_problem_file(explicit_path: str | None = None) -> str:
+    """
+    Resolve HumanEval problem file robustly:
+      1) explicit_path if exists
+      2) package resource: human_eval/data/HumanEval.jsonl
+      3) synthesize from read_problems()
+    """
+    if explicit_path and os.path.exists(explicit_path):
+        return explicit_path
 
-def _eval_humaneval_via_subprocess(samples_path, problem_file, workers, report_out=None):
+    # try importlib.resources path inside installed package
+    try:
+        import importlib.resources as ir
+        with ir.as_file(ir.files("human_eval").joinpath("data/HumanEval.jsonl")) as p:
+            if p.exists():
+                return str(p)
+    except Exception:
+        pass
+
+    # fallback: synthesize via read_problems()
+    return _synthesize_humaneval_problem_file_from_read_problems()
+
+def _print_and_maybe_save_he_summary(summary: dict, report_out: str | None):
+    pa1 = summary.get("pass@1"); pa10 = summary.get("pass@10"); pa100 = summary.get("pass@100")
+    print(f"[HumanEval] pass@1={pa1}, pass@10={pa10}, pass@100={pa100}")
+    if report_out:
+        Path(os.path.dirname(report_out) or ".").mkdir(parents=True, exist_ok=True)
+        with open(report_out, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+        print(f"[HumanEval] report saved -> {report_out}")
+
+def _eval_humaneval_via_subprocess(samples_path: str, problem_file: str, workers: int, report_out: str | None):
+    """Backup path: call harness via subprocess and robustly parse JSON from stdout."""
     cmd = [
         sys.executable, "-m", "human_eval.evaluation",
         "--samples", samples_path,
@@ -75,9 +117,9 @@ def _eval_humaneval_via_subprocess(samples_path, problem_file, workers, report_o
 
     stdout = (out.stdout or "").strip()
     if stdout:
-        print(stdout)  # keep raw output for logs
+        print(stdout)  # keep raw output
 
-    # Try to parse the largest JSON object in stdout
+    # find the largest JSON object within stdout
     summary = None
     try:
         s = stdout
@@ -97,22 +139,74 @@ def _eval_humaneval_via_subprocess(samples_path, problem_file, workers, report_o
     _print_and_maybe_save_he_summary(summary, report_out)
     return True
 
+# ------------------------------
+# HumanEval evaluation
+# ------------------------------
+def eval_humaneval(jsonl_path: str, limit=0, workers=8, report_out: str | None = None,
+                   apply_filter_code=False, apply_fix_indents=False):
+    """
+    Prefer the human_eval Python API; fallback to subprocess.
+    Optionally post-process completions (filter/indent) before writing samples.
+    """
+    rows = load_jsonl(jsonl_path)
+    if limit and limit > 0:
+        rows = rows[:limit]
 
-def _print_and_maybe_save_he_summary(summary, report_out):
-    pa1 = summary.get("pass@1"); pa10 = summary.get("pass@10"); pa100 = summary.get("pass@100")
-    print(f"[HumanEval] pass@1={pa1}, pass@10={pa10}, pass@100={pa100}")
-    if report_out:
-        Path(os.path.dirname(report_out) or ".").mkdir(parents=True, exist_ok=True)
-        with open(report_out, "w", encoding="utf-8") as f:
-            json.dump(summary, f, ensure_ascii=False, indent=2)
-        print(f"[HumanEval] report saved -> {report_out}")
+    # optional completion post-process (inspired by reference repo)
+    if apply_filter_code or apply_fix_indents:
+        for r in rows:
+            c = r.get("completion", "")
+            if apply_fix_indents:
+                c = fix_indents(c)
+            if apply_filter_code:
+                c = filter_code(c)
+            r["completion"] = c
 
+    # write samples for harness/API
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl")
+    for r in tqdm(rows, desc="prepare-humaneval", total=len(rows), dynamic_ncols=True):
+        obj = {"task_id": r["task_id"], "completion": r["completion"]}
+        tmp.write((json.dumps(obj) + "\n").encode("utf-8"))
+    tmp.close()
+
+    # robust problem-file resolution
+    problem_file = _resolve_humaneval_problem_file("human_eval/data/HumanEval.jsonl")
+
+    # Python API first
+    try:
+        from human_eval.evaluation import evaluate_functional_correctness
+        print(f"[eval] Running HumanEval (python API): samples={tmp.name}, problem_file={problem_file}, n_workers={workers}")
+        summary = evaluate_functional_correctness(
+            sample_file=tmp.name,
+            problem_file=problem_file,
+            k=[1, 10, 100],
+            n_workers=workers,
+        )
+        _print_and_maybe_save_he_summary(summary, report_out)
+        return True
+    except Exception as e:
+        print("[eval] human_eval API failed, falling back to subprocess:", e)
+
+    # fallback
+    return _eval_humaneval_via_subprocess(tmp.name, problem_file, workers, report_out)
 
 # ------------------------------
 # MBPP evaluation (unit-test runner)
 # ------------------------------
-def eval_mbpp(jsonl_path, sanitized=True, limit=0, timeout=10, report_out=None, detail_out=None):
+def eval_mbpp(jsonl_path: str, sanitized=True, limit=0, timeout=10,
+              report_out: str | None = None, detail_out: str | None = None,
+              apply_filter_code=False, apply_fix_indents=False):
     rows = load_jsonl(jsonl_path)
+    # Optional completion post-process (same knobs for consistency)
+    if apply_filter_code or apply_fix_indents:
+        for r in rows:
+            c = r.get("completion", "")
+            if apply_fix_indents:
+                c = fix_indents(c)
+            if apply_filter_code:
+                c = filter_code(c)
+            r["completion"] = c
+
     rows_by_id = {r["task_id"]: r for r in rows}
 
     name = "nlile/mbpp" if sanitized else "Muennighoff/mbpp"
@@ -123,7 +217,7 @@ def eval_mbpp(jsonl_path, sanitized=True, limit=0, timeout=10, report_out=None, 
     passed = 0
     total = 0
     failed_cases = []
-    details = []  # for JSONL detail output
+    details = []
 
     for ex in tqdm(ds, desc="eval-mbpp", total=len(ds), dynamic_ncols=True):
         task_id = str(ex.get("task_id"))
@@ -189,18 +283,27 @@ def eval_mbpp(jsonl_path, sanitized=True, limit=0, timeout=10, report_out=None, 
 
     return True
 
-
+# ------------------------------
+# CLI
+# ------------------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", required=True, choices=["humaneval", "mbpp"])
-    ap.add_argument("--pred", required=True, help="path to JSONL from gen_code.py")
+    ap.add_argument("--pred", required=True, help="path to JSONL predictions")
     ap.add_argument("--limit", type=int, default=0, help="if >0, evaluate only first N")
     ap.add_argument("--report_out", type=str, default="", help="save summary JSON to this path")
+
     # HumanEval-only
     ap.add_argument("--workers", type=int, default=8, help="HumanEval harness n_workers")
+
     # MBPP-only
     ap.add_argument("--timeout", type=int, default=10, help="MBPP per-task timeout (seconds)")
     ap.add_argument("--detail_out", type=str, default="", help="save per-task MBPP results (JSONL)")
+
+    # Optional completion post-process (reference repo style)
+    ap.add_argument("--apply_filter_code", action="store_true", help="strip to the first function block before eval")
+    ap.add_argument("--fix_indents", action="store_true", help="replace tabs with 4 spaces before eval")
+
     args = ap.parse_args()
 
     if args.dataset == "humaneval":
@@ -209,6 +312,8 @@ def main():
             limit=args.limit,
             workers=args.workers,
             report_out=(args.report_out or None),
+            apply_filter_code=args.apply_filter_code,
+            apply_fix_indents=args.fix_indents,
         )
     else:
         ok = eval_mbpp(
@@ -218,11 +323,12 @@ def main():
             timeout=args.timeout,
             report_out=(args.report_out or None),
             detail_out=(args.detail_out or None),
+            apply_filter_code=args.apply_filter_code,
+            apply_fix_indents=args.fix_indents,
         )
 
     if not ok:
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
