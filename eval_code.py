@@ -24,61 +24,88 @@ def load_jsonl(path):
 
 
 # ------------------------------
-# HumanEval evaluation (OpenAI harness)
+# HumanEval evaluation
 # ------------------------------
 def eval_humaneval(jsonl_path, limit=0, workers=8, report_out=None):
+    """
+    Prefer the human_eval Python API for stable JSON results.
+    Fallback to subprocess only if the module is not importable.
+    """
     rows = load_jsonl(jsonl_path)
     if limit and limit > 0:
         rows = rows[:limit]
 
-    # prepare samples file for harness
+    # Prepare samples file for the harness/API: [{"task_id","completion"}, ...]
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl")
     for r in tqdm(rows, desc="prepare-humaneval", total=len(rows), dynamic_ncols=True):
         obj = {"task_id": r["task_id"], "completion": r["completion"]}
         tmp.write((json.dumps(obj) + "\n").encode("utf-8"))
     tmp.close()
 
+    problem_file = "human_eval/data/HumanEval.jsonl"
+
+    # Try Python API
+    try:
+        from human_eval.evaluation import evaluate_functional_correctness
+        print(f"[eval] Running HumanEval (python API): samples={tmp.name}, problem_file={problem_file}, n_workers={workers}")
+        summary = evaluate_functional_correctness(
+            sample_file=tmp.name,
+            problem_file=problem_file,
+            k=[1, 10, 100],
+            n_workers=workers,
+        )
+        _print_and_maybe_save_he_summary(summary, report_out)
+        return True
+    except Exception as e:
+        print("[eval] human_eval import failed, falling back to subprocess:", e)
+
+    # Fallback: subprocess (robust JSON extraction)
+    return _eval_humaneval_via_subprocess(tmp.name, problem_file, workers, report_out)
+
+
+def _eval_humaneval_via_subprocess(samples_path, problem_file, workers, report_out=None):
     cmd = [
         sys.executable, "-m", "human_eval.evaluation",
-        "--samples", tmp.name,
-        "--problem_file", "human_eval/data/HumanEval.jsonl",
+        "--samples", samples_path,
+        "--problem_file", problem_file,
         "--n_workers", str(workers),
     ]
-    print("[eval] Running HumanEval harness:", " ".join(cmd))
+    print("[eval] Running HumanEval harness (subprocess):", " ".join(cmd))
     out = subprocess.run(cmd, capture_output=True, text=True)
 
-    # HumanEval harness prints a json line summary, e.g. {"pass@1": 0.35, "pass@10": ..., ...}
-    summary = None
-    stdout = out.stdout.strip()
+    stdout = (out.stdout or "").strip()
     if stdout:
         print(stdout)  # keep raw output for logs
-        # try parse last non-empty line as JSON
-        last = stdout.splitlines()[-1]
-        try:
-            summary = json.loads(last)
-        except Exception:
-            try:
-                summary = json.loads(stdout)
-            except Exception:
-                summary = None
+
+    # Try to parse the largest JSON object in stdout
+    summary = None
+    try:
+        s = stdout
+        l = s.find("{"); r = s.rfind("}")
+        if l != -1 and r != -1 and r > l:
+            summary = json.loads(s[l:r+1])
+    except Exception:
+        summary = None
 
     if out.returncode != 0:
         print(out.stderr, file=sys.stderr)
 
-    if summary:
-        pa1 = summary.get("pass@1")
-        pa10 = summary.get("pass@10")
-        pa100 = summary.get("pass@100")
-        print(f"[HumanEval] pass@1={pa1}, pass@10={pa10}, pass@100={pa100}")
-        if report_out:
-            Path(os.path.dirname(report_out) or ".").mkdir(parents=True, exist_ok=True)
-            with open(report_out, "w", encoding="utf-8") as f:
-                json.dump(summary, f, ensure_ascii=False, indent=2)
-            print(f"[HumanEval] report saved -> {report_out}")
-    else:
+    if not summary:
         print("[HumanEval] Could not parse summary JSON from harness stdout.")
+        return False
 
-    return out.returncode == 0
+    _print_and_maybe_save_he_summary(summary, report_out)
+    return True
+
+
+def _print_and_maybe_save_he_summary(summary, report_out):
+    pa1 = summary.get("pass@1"); pa10 = summary.get("pass@10"); pa100 = summary.get("pass@100")
+    print(f"[HumanEval] pass@1={pa1}, pass@10={pa10}, pass@100={pa100}")
+    if report_out:
+        Path(os.path.dirname(report_out) or ".").mkdir(parents=True, exist_ok=True)
+        with open(report_out, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+        print(f"[HumanEval] report saved -> {report_out}")
 
 
 # ------------------------------
@@ -100,7 +127,6 @@ def eval_mbpp(jsonl_path, sanitized=True, limit=0, timeout=10, report_out=None, 
 
     for ex in tqdm(ds, desc="eval-mbpp", total=len(ds), dynamic_ncols=True):
         task_id = str(ex.get("task_id"))
-        # skip if no prediction for this task
         if task_id not in rows_by_id:
             continue
 
@@ -127,7 +153,7 @@ def eval_mbpp(jsonl_path, sanitized=True, limit=0, timeout=10, report_out=None, 
             ok = (proc.returncode == 0) and ("PASSED" in proc.stdout)
             if not ok:
                 err = (proc.stderr or "") + "\n" + (proc.stdout or "")
-        except subprocess.TimeoutExpired as e:
+        except subprocess.TimeoutExpired:
             ok = False
             err = f"Timeout after {timeout}s"
 
@@ -140,16 +166,14 @@ def eval_mbpp(jsonl_path, sanitized=True, limit=0, timeout=10, report_out=None, 
         details.append({
             "task_id": task_id,
             "passed": ok,
-            "error": err[:2000] if err else "",  # truncate long output
+            "error": err[:2000] if err else "",
         })
 
-    # summary
     ratio = (passed / total) if total else 0.0
     print(f"[MBPP] pass@1: {passed}/{total} = {ratio:.3f}")
     if failed_cases:
         print("[MBPP] failed task_ids (first 20):", failed_cases[:20])
 
-    # save summaries
     if report_out:
         Path(os.path.dirname(report_out) or ".").mkdir(parents=True, exist_ok=True)
         with open(report_out, "w", encoding="utf-8") as f:
