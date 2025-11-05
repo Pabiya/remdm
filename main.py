@@ -210,13 +210,33 @@ def main(config):
   if config.mode == 'sample_eval':
     samples, gen_ppl, entropies = generate_samples(config, logger, tokenizer)
     # compute MAUVE score
+    # human_references = []
+    # _, valid_loader = dataloader.get_dataloaders(config, tokenizer, valid_seed=config.seed, skip_train=True)
+    # for _ in range(config.sampling.num_sample_batches):    
+    #     batch = next(iter(valid_loader))
+    #     input_ids = batch['input_ids']
+    #     human_references.extend(tokenizer.batch_decode(input_ids))
+    # assert len(samples) == len(human_references)
+
     human_references = []
-    _, valid_loader = dataloader.get_dataloaders(config, tokenizer, valid_seed=config.seed, skip_train=True)
-    for _ in range(config.sampling.num_sample_batches):    
-        batch = next(iter(valid_loader))
-        input_ids = batch['input_ids']
-        human_references.extend(tokenizer.batch_decode(input_ids))
+    _, valid_loader = dataloader.get_dataloaders(
+        config, tokenizer, valid_seed=config.seed, skip_train=True)
+
+    it = iter(valid_loader)
+    need = len(samples)  # 생성 텍스트 개수와 정확히 맞춤
+    while need > 0:
+        try:
+            batch = next(it)            # 연속 배치 소비
+        except StopIteration:
+            it = iter(valid_loader)     # 끝나면 다시 시작(필요시)
+            batch = next(it)
+        texts = tokenizer.batch_decode(batch["input_ids"])
+        take = min(need, len(texts))
+        human_references.extend(texts[:take])
+        need -= take
+
     assert len(samples) == len(human_references)
+    
     results = mauve.compute_mauve(p_text=human_references, q_text=samples, device_id=0, max_text_length=1024, verbose=False)
     mauve_score = results.mauve
 

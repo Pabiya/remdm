@@ -14,7 +14,7 @@
 
 checkpoint_path=/home/junsu0115/remdm/outputs/checkpoints/mdlm.ckpt
 T=0
-sampling_steps=1024
+sampling_steps=256
 p=0.9
 generated_seqs_path=/home/junsu0115/remdm/outputs/remdm-conf_T-${sampling_steps}_topp-${p}.json
 
@@ -51,7 +51,7 @@ python -u -m main \
     model=small \
     parameterization=subs \
     backbone=dit \
-    model.length=1024 \
+    model.length=256 \
     eval.checkpoint_path=${checkpoint_path} \
     time_conditioning=false \
     +wandb.offline=true \
@@ -59,7 +59,7 @@ python -u -m main \
     T=${T} \
     sampling.steps=${sampling_steps} \
     seed=1 \
-    sampling.num_sample_batches=10 \
+    sampling.num_sample_batches=100 \
     sampling.generated_seqs_path=${generated_seqs_path} \
     sampling.nucleus_p=${p} \
     sampling.sampler="remdm-conf"
