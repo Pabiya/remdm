@@ -863,55 +863,86 @@ class Diffusion(L.LightningModule):
       conf[remask_mask] = -torch.inf             # 다시 마스크되면 캐시 무효화
 
     elif self.config.sampling.sampler == 'refine-conf':
-        # 공통 전처리 (alpha_t/s, sigma_max, masked_flag, 1st pass p_x0로 x의 [MASK] 위치 언마스크) 는
-        # refine-ent-2 분기와 동일하게 작성.
+        # ===== In-step refine with confidence-based targeting =====
+        eps = 1e-12
+        if not hasattr(self, "_ddpm_cache_step_idx"):
+            self._ddpm_cache_step_idx = 0
 
-        # === 선택 가중치: confidence 기반 ===
-        # conf에는 '언마스크 시점'의 confidence를 저장한다고 가정
-        # (remdm-conf 분기에서 conf를 갱신해온 정의를 재사용).
-        # 낮은 confidence(=불확실)가 우선 리파인되도록, 예: eta = softmax(-conf_norm)
-        conf_norm = conf.clone()
-        # -inf 처리: 이미 [MASK]거나 아직 값이 없으면 제외
+        # 주기적 실행: k=1이면 매 스텝 실행
+        refine_every = int(getattr(self.config.sampling, "refine_every", 1))
+        do_refine = (self._ddpm_cache_step_idx % max(1, refine_every)) == 0
+
+        # 스케줄 파라미터/상한 (ReMDM posterior의 계수 비음수 보장 목적)
+        alpha_t = (1.0 - move_chance_t)[0].item()
+        alpha_s = (1.0 - move_chance_s)[0].item()
+        sigma_max = min(1.0, (1.0 - alpha_s) / max(eps, alpha_t))
+        denom = max(eps, 1.0 - alpha_t)
+
+        # 1st forward는 상단에서 p_x0가 준비되어 있음 (top-p 적용 포함)
         masked_flag = (x == self.mask_index)
-        conf_norm = conf_norm.masked_fill(masked_flag, float('inf'))  # 제외
-        eta = torch.softmax(-conf_norm, dim=-1)  # confidence 낮을수록 큰 weight
-        eta = eta.masked_fill(masked_flag, 0.0)
+        xs = x.clone()
 
-        sigma = (eta * sigma_max).clamp_(0.0, 1.0)
-        R = (torch.rand_like(sigma) < sigma) & (~masked_flag)
+        # --- (A) [MASK]였던 위치: MDLM posterior(q_xs_2)로 언마스크 ---
+        if masked_flag.any():
+            # q_xs_2(token) = p_x0(token) * ((alpha_s - alpha_t)/(1 - alpha_t))
+            # q_xs_2([MASK]) = (1 - alpha_s)/(1 - alpha_t)
+            q_xs_2 = p_x0 * ((alpha_s - alpha_t) / denom)
+            q_xs_2[..., self.mask_index] = (1.0 - alpha_s) / denom
+            q_xs_2 = q_xs_2.clamp_min(eps)
+            q_xs_2 = q_xs_2 / q_xs_2.sum(dim=-1, keepdim=True).clamp_min(eps)
 
-        xs = xs.clone()
-        if R.any():
-            x_tmp = xs.clone()
-            x_tmp[R] = self.mask_index
-            log_p_x0_2 = self.forward(x_tmp, sigma_t)
+            _x_mask = _sample_categorical(q_xs_2)
+            xs[masked_flag] = _x_mask[masked_flag]
 
-            # nucleus(top-p) 재적용 (파일의 다른 분기들과 동일)
-            if self.config.sampling.nucleus_p < 1.0:
-                p2 = log_p_x0_2.exp()
-                sorted_probs, sorted_indices = torch.sort(p2, descending=True, dim=-1)
-                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-                top_p_mask = (cumulative_probs <= self.config.sampling.nucleus_p)
-                top_p_mask[..., 0] = True
-                nucleus_probs = sorted_probs * top_p_mask
-                nucleus_probs = nucleus_probs / nucleus_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-                p_x0_2 = torch.zeros_like(p2).scatter_(-1, sorted_indices, nucleus_probs)
-            else:
-                p_x0_2 = log_p_x0_2.exp()
+        # --- (B) In-step refine (confidence 기반 선택) ---
+        if do_refine:
+            # conf: (B, L), '언마스크 시점'의 confidence 캐시
+            # 낮은 confidence(=불확실)일수록 우선 → eta = softmax(-conf_norm)
+            conf_norm = conf.clone()
+            # 현재 [MASK] 위치는 후보 제외
+            conf_norm = conf_norm.masked_fill(masked_flag, float('inf'))
+            eta = torch.softmax(-conf_norm, dim=-1)
+            eta = eta.masked_fill(masked_flag, 0.0)
 
-            _refine = _sample_categorical(p_x0_2)
-            xs[R] = _refine[R]
+            # per-token sigma (브로드캐스트 OK: sigma_max는 스칼라)
+            sigma = (eta * sigma_max).clamp_(0.0, 1.0)
 
-            # === 리파인 직후 confidence 캐시 갱신 ===
-            # confidence 정의를 remdm-conf와 일관되게:
-            #   예1) -log p(token*)  예2) 1 - p(token*)  예3) -p(token*)
-            # remdm-conf가 현재 "- p_x0[token*]"를 쓰니, 동일 정의 사용:
-            b_idx = torch.arange(xs.shape[0])[:, None]
-            pos_idx = torch.arange(xs.shape[1])[None, :]
-            new_conf = - p_x0_2[b_idx, pos_idx, xs]  # (B,L)
-            conf[R] = new_conf[R]
+            # Bernoulli(sigma)로 R 선정 (언마스크 위치에서만)
+            unmasked_flag = ~masked_flag
+            R = (torch.rand_like(sigma) < sigma) & unmasked_flag
 
-        # 이번 step에서 [MASK]->토큰으로 바뀐 자리의 최초 confidence 기록 (remdm-conf 정의와 동일)
+            if R.any():
+                # R을 잠깐 [MASK]로 되돌려 2nd forward
+                x_tmp = xs.clone()
+                x_tmp[R] = self.mask_index
+
+                log_p_x0_2 = self.forward(x_tmp, sigma_t)
+
+                # nucleus(top-p) 재적용
+                if self.config.sampling.nucleus_p < 1.0:
+                    p2 = log_p_x0_2.exp()
+                    sorted_probs, sorted_indices = torch.sort(p2, descending=True, dim=-1)
+                    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                    top_p_mask = (cumulative_probs <= self.config.sampling.nucleus_p)
+                    top_p_mask[..., 0] = True
+                    nucleus_probs = sorted_probs * top_p_mask
+                    nucleus_probs = nucleus_probs / nucleus_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+                    p_x0_2 = torch.zeros_like(p2).scatter_(-1, sorted_indices, nucleus_probs)
+                else:
+                    p_x0_2 = log_p_x0_2.exp()
+
+                # R 위치만 재샘플 → 즉시 언마스크(=refine)
+                _refine = _sample_categorical(p_x0_2)
+                xs[R] = _refine[R]
+
+                # (중요) refine 직후 confidence 캐시 갱신 (remdm-conf와 동일 정의)
+                # new_conf = - p_x0_2[token*]  (값이 작을수록 신뢰 높음)
+                b_idx = torch.arange(xs.shape[0])[:, None]
+                pos_idx = torch.arange(xs.shape[1])[None, :]
+                new_conf = - p_x0_2[b_idx, pos_idx, xs]  # (B, L)
+                conf[R] = new_conf[R]
+
+        # --- (C) 이번 step에서 새로 [MASK]->토큰 된 위치의 '최초' confidence 기록 ---
         unmask_mask = (x == self.mask_index) & (xs != self.mask_index)
         if unmask_mask.any():
             b_idx = torch.arange(xs.shape[0])[:, None]
@@ -919,7 +950,26 @@ class Diffusion(L.LightningModule):
             conf_values = - p_x0[b_idx, pos_idx, xs]
             conf[unmask_mask] = conf_values[unmask_mask]
 
-        # step index 증가/캐시 반환 규칙 등은 refine-ent-2와 동일
+        # ---- (선택) 통계/트레이스 로깅 ----
+        if getattr(self.config.sampling, "print_prob_entropy_stats", False):
+            pe_every = int(getattr(self.config.sampling, "print_every", 1))
+            if (self._ddpm_cache_step_idx % max(1, pe_every)) == 0:
+                self._print_prob_entropy_stats(p_x0, x, step=int(self._ddpm_cache_step_idx))
+
+        if getattr(self.config.sampling, "log_unmask_remask_order", False):
+            self._trace_unmask_remask_update(x, xs)
+
+        # step++
+        self._ddpm_cache_step_idx += 1
+
+        # 캐시 반환 규칙 (기존 분기와 동일)
+        if torch.allclose(xs, x) and not self.time_conditioning:
+            p_x0_cache = p_x0
+        else:
+            p_x0_cache = None
+
+        return p_x0_cache, xs, conf
+
 
 
     elif self.config.sampling.sampler == 'remdm-loop':
